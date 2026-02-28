@@ -26,7 +26,6 @@ def analyze_exposure(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     mean = np.mean(gray)
 
-    # normalize to 0-100 score
     score = 100 - abs(mean - 127) * 0.8
     score = max(0, min(100, score))
 
@@ -50,23 +49,19 @@ def analyze_contrast(image):
 # -------------------------
 def analyze_color_balance(image):
 
-    # convert BGR to RGB
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     r_mean = np.mean(rgb[:, :, 0])
     g_mean = np.mean(rgb[:, :, 1])
     b_mean = np.mean(rgb[:, :, 2])
 
-    # green as reference channel
     r_diff = r_mean - g_mean
     b_diff = b_mean - g_mean
 
     cast_strength = abs(r_diff) + abs(b_diff)
 
-    # higher cast = lower score
     score = max(0, 100 - cast_strength * 0.5)
 
-    # temperature estimation
     if r_mean > b_mean:
         temperature = "warm"
     elif b_mean > r_mean:
@@ -86,6 +81,72 @@ def analyze_color_balance(image):
 
 
 # -------------------------
+# SKIN TONE ANALYSIS
+# -------------------------
+def analyze_skin_tones(image):
+
+    ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+
+    # Skin detection range
+    lower = np.array([0, 135, 85], dtype=np.uint8)
+    upper = np.array([255, 180, 135], dtype=np.uint8)
+
+    mask = cv2.inRange(ycrcb, lower, upper)
+
+    skin_pixels = cv2.bitwise_and(image, image, mask=mask)
+
+    skin_count = np.sum(mask > 0)
+    total_pixels = image.shape[0] * image.shape[1]
+
+    skin_ratio = skin_count / total_pixels
+
+    if skin_count == 0:
+        return 50, {
+            "skin_detected": False,
+            "skin_ratio": 0
+        }
+
+    # Mean skin color
+    skin_rgb = cv2.cvtColor(skin_pixels, cv2.COLOR_BGR2RGB)
+    r = skin_rgb[:, :, 0][mask > 0]
+    g = skin_rgb[:, :, 1][mask > 0]
+    b = skin_rgb[:, :, 2][mask > 0]
+
+    r_mean = np.mean(r)
+    g_mean = np.mean(g)
+    b_mean = np.mean(b)
+
+    # Ideal cinematic skin reference
+    ideal_r = 180
+    ideal_g = 140
+    ideal_b = 120
+
+    deviation = abs(r_mean - ideal_r) + abs(g_mean - ideal_g) + abs(b_mean - ideal_b)
+
+    score = max(0, 100 - deviation * 0.3)
+
+    # Temperature estimation
+    if r_mean > b_mean:
+        temp = "warm"
+    elif b_mean > r_mean:
+        temp = "cool"
+    else:
+        temp = "neutral"
+
+    data = {
+        "skin_detected": True,
+        "skin_ratio": float(skin_ratio),
+        "r_mean": float(r_mean),
+        "g_mean": float(g_mean),
+        "b_mean": float(b_mean),
+        "temperature": temp,
+        "deviation": float(deviation)
+    }
+
+    return score, data
+
+
+# -------------------------
 # MAIN ANALYZE ENDPOINT
 # -------------------------
 @app.post("/analyze")
@@ -101,11 +162,13 @@ async def analyze(file: UploadFile = File(...)):
     exposure_score, exposure_value = analyze_exposure(image)
     contrast_score, contrast_value = analyze_contrast(image)
     color_score, color_data = analyze_color_balance(image)
+    skin_score, skin_data = analyze_skin_tones(image)
 
     cinematic_score = int(
-        (exposure_score * 0.4) +
-        (contrast_score * 0.3) +
-        (color_score * 0.3)
+        (exposure_score * 0.3) +
+        (contrast_score * 0.25) +
+        (color_score * 0.25) +
+        (skin_score * 0.2)
     )
 
     return {
@@ -114,11 +177,13 @@ async def analyze(file: UploadFile = File(...)):
         "breakdown": {
             "exposure": round(exposure_score, 1),
             "contrast": round(contrast_score, 1),
-            "color_balance": round(color_score, 1)
+            "color_balance": round(color_score, 1),
+            "skin_tone": round(skin_score, 1)
         },
         "metrics": {
             "mean_luminance": round(float(exposure_value), 2),
             "contrast_std": round(float(contrast_value), 2),
-            "color": color_data
+            "color": color_data,
+            "skin": skin_data
         }
     }
