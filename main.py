@@ -13,35 +13,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------------
-# Meta
-# ------------------------------------------------------------
-
-SERVICE_NAME = "cinemind-api-v4-suggestions"
-
+# =============================
+# Health / Root
+# =============================
 
 @app.get("/")
 def root():
-    # Useful for quick verification in Render + browser
-    return {"service": SERVICE_NAME}
-
+    # utile per verificare a colpo d’occhio quale versione è deployata
+    return {"service": "cinemind-api-v4-suggestions"}
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": SERVICE_NAME}
+    return {"ok": True, "service": "cinemind-api-v4-suggestions"}
 
 
-# ------------------------------------------------------------
+# =============================
 # Utility
-# ------------------------------------------------------------
+# =============================
 
 def clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
 
-
 def clamp100(x: float) -> float:
     return float(max(0.0, min(100.0, x)))
-
 
 def safe_resize_for_speed(img, max_dim=1280):
     h, w = img.shape[:2]
@@ -51,7 +45,6 @@ def safe_resize_for_speed(img, max_dim=1280):
     scale = max_dim / m
     return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-
 def central_roi(gray, frac=0.45):
     h, w = gray.shape[:2]
     ch = int(h * frac)
@@ -60,9 +53,7 @@ def central_roi(gray, frac=0.45):
     x0 = (w - cw) // 2
     return gray[y0:y0 + ch, x0:x0 + cw], (x0, y0, cw, ch)
 
-
 def outer_ring_mask(h, w, inner_frac=0.55):
-    # outer ring = everything outside a central rectangle
     mask = np.ones((h, w), dtype=np.uint8)
     ch = int(h * inner_frac)
     cw = int(w * inner_frac)
@@ -72,216 +63,149 @@ def outer_ring_mask(h, w, inner_frac=0.55):
     return mask
 
 
-# ------------------------------------------------------------
-# Exposure Analysis v2 (Rec.709 preview)
-# Fix: mean-luma alone is misleading (haze / lifted blacks / clipped highlights)
-# ------------------------------------------------------------
+# =============================
+# Exposure Analysis (Rec709-like)
+# =============================
 
-def analyze_exposure_v2(image_bgr):
-    img = safe_resize_for_speed(image_bgr, max_dim=1400)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.uint8)
+def analyze_exposure(image_bgr):
+    """
+    Exposure in Rec.709 preview should be judged by:
+    - highlight clipping (pixels near 255)
+    - shadow clipping (pixels near 0)
+    - percentiles (p50, p95, p99) rather than only mean
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.uint8)
 
     mean = float(np.mean(gray))
-    p1 = float(np.percentile(gray, 1))
-    p5 = float(np.percentile(gray, 5))
+    p5  = float(np.percentile(gray, 5))
     p50 = float(np.percentile(gray, 50))
     p95 = float(np.percentile(gray, 95))
     p99 = float(np.percentile(gray, 99))
 
-    # clipping ratios (Rec709 8-bit)
-    hi_clip = float(np.mean(gray >= 250))  # 0..1
-    lo_clip = float(np.mean(gray <= 5))    # 0..1
+    # clipping fractions
+    highlight_clip = float(np.mean(gray >= 250))  # 0..1
+    shadow_clip    = float(np.mean(gray <= 5))    # 0..1
 
-    # dynamic range proxy
-    dr = float(max(0.0, p99 - p1))
-
-    # Determine state (simple and robust)
-    # Overexposed if: significant highlight clipping OR very high p95/p99
-    over = (hi_clip >= 0.01) or (p99 >= 248.0) or (p95 >= 235.0)
-    # Underexposed if: significant shadow clipping OR very low p5/p1
-    under = (lo_clip >= 0.02) or (p1 <= 3.0) or (p5 <= 12.0)
-
-    if over and not under:
+    # exposure state (simple but robust for Rec709 previews)
+    state = "ok"
+    if highlight_clip > 0.015 or p95 > 235 or p99 > 248:
         state = "overexposed"
-    elif under and not over:
+    elif shadow_clip > 0.015 or p50 < 55:
         state = "underexposed"
-    elif over and under:
-        # both ends clipped => crushed + clipped / harsh grade or wrong preview
-        state = "clipped_both"
-    else:
-        state = "ok"
 
-    # Score model (penalize clipping heavily; mean only mildly)
-    # Targets (Rec709-ish): p50 ~ 95–135 depending on scene; we keep it soft.
-    target_mid = 115.0
-    mid_penalty = abs(p50 - target_mid) * 0.25  # mild
+    # score: start at 100, penalize clipping heavily, then midtone drift
+    score = 100.0
 
-    hi_penalty = (hi_clip * 900.0) + max(0.0, (p99 - 245.0) * 1.8) + max(0.0, (p95 - 230.0) * 0.9)
-    lo_penalty = (lo_clip * 500.0) + max(0.0, (10.0 - p5) * 1.2) + max(0.0, (2.0 - p1) * 3.0)
+    # heavy penalties for clipping
+    score -= min(60.0, highlight_clip * 3000.0)  # 1% -> -30
+    score -= min(45.0, shadow_clip * 2500.0)     # 1% -> -25
 
-    # If DR is extremely low, it often indicates haze / lifted blacks / flat preview
-    # Not strictly exposure, but it affects "image density".
-    dr_penalty = 0.0
-    if dr < 60.0:
-        dr_penalty = (60.0 - dr) * 0.35
+    # midtone target for Rec709 previews (rough)
+    # keep this light so we don't misclassify high-key shots
+    target_mid = 120.0
+    score -= min(20.0, abs(p50 - target_mid) * 0.15)
 
-    score = 100.0 - (mid_penalty + hi_penalty + lo_penalty + dr_penalty)
     score = clamp100(score)
 
-    return score, {
-        "mean_luma": mean,
-        "p1": p1,
-        "p5": p5,
-        "p50": p50,
-        "p95": p95,
-        "p99": p99,
-        "highlight_clip_ratio": hi_clip,
-        "shadow_clip_ratio": lo_clip,
-        "dynamic_range_p99_p1": dr,
-        "state": state,
+    metrics = {
+        "mean": round(mean, 3),
+        "p5": round(p5, 3),
+        "p50": round(p50, 3),
+        "p95": round(p95, 3),
+        "p99": round(p99, 3),
+        "highlight_clip": round(highlight_clip, 6),
+        "shadow_clip": round(shadow_clip, 6),
+        "state": state
     }
+    return score, metrics
 
 
-# ------------------------------------------------------------
-# Contrast Analysis (Rec.709 preview)
-# ------------------------------------------------------------
+# =============================
+# Contrast Analysis (Rec709-like)
+# =============================
 
 def analyze_contrast(image_bgr):
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     std = float(np.std(gray))
 
-    # Cinematic “usable” contrast often around std ~ 45–65 (content-dependent)
+    # keep your old idea but make it a bit safer
+    # target std in many Rec709 previews: ~45-65 (very content dependent)
     target = 55.0
     score = 100.0 - abs(std - target) * 1.2
-    return clamp100(score), std
+    return clamp100(score), float(std)
 
 
-# ------------------------------------------------------------
-# Color Balance Analysis v2 (temperature + tint, highlight-weighted)
-# Fix: global RGB means miss casts that live in highlights / neutrals
-# ------------------------------------------------------------
+# =============================
+# Color Balance / Cast Analysis (Lab-based)
+# =============================
 
-def _lab_stats(lab_img, mask=None):
-    if mask is None:
-        a = lab_img[:, :, 1].astype(np.float32)
-        b = lab_img[:, :, 2].astype(np.float32)
-    else:
-        a = lab_img[:, :, 1][mask > 0].astype(np.float32)
-        b = lab_img[:, :, 2][mask > 0].astype(np.float32)
-        if a.size < 50 or b.size < 50:
-            return None
+def analyze_color_balance(image_bgr):
+    """
+    Use Lab to detect cast:
+    - a* negative = green, a* positive = magenta
+    - b* negative = blue/cool, b* positive = yellow/warm
+    """
+    b, g, r = cv2.split(image_bgr)
+    r_mean = float(np.mean(r))
+    g_mean = float(np.mean(g))
+    b_mean = float(np.mean(b))
 
-    # OpenCV Lab: L in [0..255], a,b in [0..255] with 128 as "neutral"
-    a_mean = float(np.mean(a) - 128.0)  # - => green, + => magenta
-    b_mean = float(np.mean(b) - 128.0)  # - => blue (cool), + => yellow (warm)
-    a_std = float(np.std(a))
-    b_std = float(np.std(b))
-    return {
-        "a_mean": a_mean,
-        "b_mean": b_mean,
-        "a_std": a_std,
-        "b_std": b_std,
-    }
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    # OpenCV Lab: L in [0..255], a,b in [0..255] with 128 as neutral
+    a = lab[:, :, 1] - 128.0
+    bb = lab[:, :, 2] - 128.0
 
+    a_mean = float(np.mean(a))
+    b_lab_mean = float(np.mean(bb))
 
-def analyze_color_balance_v2(image_bgr):
-    img = safe_resize_for_speed(image_bgr, max_dim=1400)
+    cast_strength = float(np.sqrt(a_mean * a_mean + b_lab_mean * b_lab_mean))
 
-    # For masks, use luminance from Rec709-like grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.uint8)
-
-    # Highlights = top 15% brightest pixels (more stable than a fixed threshold)
-    thr_hi = float(np.percentile(gray, 85))
-    hi_mask = (gray >= thr_hi).astype(np.uint8) * 255
-
-    # Midtones = between 30th and 70th percentile
-    lo_mid = float(np.percentile(gray, 30))
-    hi_mid = float(np.percentile(gray, 70))
-    mid_mask = ((gray >= lo_mid) & (gray <= hi_mid)).astype(np.uint8) * 255
-
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-
-    global_stats = _lab_stats(lab, None)
-    hi_stats = _lab_stats(lab, hi_mask)
-    mid_stats = _lab_stats(lab, mid_mask)
-
-    # Prefer highlights for WB cast detection (common in real shooting)
-    use = hi_stats if hi_stats is not None else global_stats
-    a = use["a_mean"]  # tint
-    b = use["b_mean"]  # temp
-
-    # Convert to interpretable labels
-    # thresholds tuned for 8-bit Lab (rough but stable)
-    def temp_label(b_mean):
-        if b_mean <= -8:
-            return "cool"
-        if b_mean >= 8:
-            return "warm"
-        return "neutral"
-
-    def tint_label(a_mean):
-        if a_mean <= -6:
-            return "green"
-        if a_mean >= 6:
-            return "magenta"
-        return "neutral"
-
-    temperature = temp_label(b)
-    tint = tint_label(a)
-
-    # Cast strength: combined magnitude (treat temp + tint)
-    cast_strength = float(np.sqrt((a * a) + (b * b)))  # ~0..(large)
-    # Score: allow some grade, but penalize stronger casts
-    # If cast_strength <= ~6: basically neutral; beyond ~18 gets heavily penalized
-    score = 100.0 - max(0.0, (cast_strength - 6.0) * 3.2)
+    # score: penalize cast (cast_strength ~ 0-5 is near neutral; >12 obvious)
+    score = 100.0 - cast_strength * 4.0
     score = clamp100(score)
 
-    # Also keep simple RGB means (useful to debug)
-    bch, gch, rch = cv2.split(img)
-    rgb_means = {
-        "r_mean": float(np.mean(rch)),
-        "g_mean": float(np.mean(gch)),
-        "b_mean": float(np.mean(bch)),
-    }
+    temperature = "neutral"
+    if b_lab_mean > 6:
+        temperature = "warm"
+    elif b_lab_mean < -6:
+        temperature = "cool"
+
+    tint = "neutral"
+    if a_mean > 6:
+        tint = "magenta"
+    elif a_mean < -6:
+        tint = "green"
 
     metrics = {
-        "rgb_means": rgb_means,
-        "lab_global": global_stats,
-        "lab_highlights": hi_stats,
-        "lab_midtones": mid_stats,
+        "r_mean": round(r_mean, 3),
+        "g_mean": round(g_mean, 3),
+        "b_mean": round(b_mean, 3),
+        "lab_a_mean": round(a_mean, 3),
+        "lab_b_mean": round(b_lab_mean, 3),
+        "cast_strength": round(cast_strength, 3),
         "temperature": temperature,
-        "tint": tint,
-        "cast_strength": cast_strength,
-        "reference": "highlights" if hi_stats is not None else "global",
+        "tint": tint
     }
-
     return score, metrics
 
 
-# ------------------------------------------------------------
+# =============================
 # Skin Tone Detection (simple HSV mask)
-# Note: this is a heuristic; keep it as a component, not a judge of "grade"
-# ------------------------------------------------------------
+# =============================
 
 def analyze_skin(image_bgr):
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
 
-    # broad skin range; works ok on Rec709 previews
     lower = np.array([0, 20, 70], dtype=np.uint8)
     upper = np.array([25, 255, 255], dtype=np.uint8)
-
     mask = cv2.inRange(hsv, lower, upper)
 
     total_pixels = image_bgr.shape[0] * image_bgr.shape[1]
     skin_count = int(np.count_nonzero(mask))
     ratio = float(skin_count / (total_pixels + 1e-6))
 
-    # if almost no skin, return neutral score and metrics
-    if skin_count < 50 or ratio < 0.01:
-        return 50.0, {
-            "skin_detected": False,
-            "skin_ratio": ratio
-        }
+    if skin_count < 80 or ratio < 0.01:
+        return 50.0, {"skin_detected": False, "skin_ratio": round(ratio, 6)}
 
     skin_pixels = cv2.bitwise_and(image_bgr, image_bgr, mask=mask)
     b, g, r = cv2.split(skin_pixels)
@@ -294,9 +218,7 @@ def analyze_skin(image_bgr):
     g_mean = float(np.mean(g_vals))
     b_mean = float(np.mean(b_vals))
 
-    # deviation proxy: how far channels diverge (very rough)
     deviation = float(abs(r_mean - g_mean) + abs(r_mean - b_mean))
-
     score = 100.0 - deviation * 0.5
     score = clamp100(score)
 
@@ -308,18 +230,18 @@ def analyze_skin(image_bgr):
 
     return score, {
         "skin_detected": True,
-        "skin_ratio": ratio,
-        "r_mean": r_mean,
-        "g_mean": g_mean,
-        "b_mean": b_mean,
+        "skin_ratio": round(ratio, 6),
+        "r_mean": round(r_mean, 3),
+        "g_mean": round(g_mean, 3),
+        "b_mean": round(b_mean, 3),
         "temperature": temperature,
-        "deviation": deviation
+        "deviation": round(deviation, 3)
     }
 
 
-# ------------------------------------------------------------
+# =============================
 # Noise / Image Quality
-# ------------------------------------------------------------
+# =============================
 
 def analyze_noise(image_bgr):
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -331,31 +253,28 @@ def analyze_noise(image_bgr):
     mean_signal = float(np.mean(gray)) + 1e-6
     snr = float(mean_signal / (noise_std + 1e-6))
 
-    # score: lower noise_std is better
     noise_score = 100.0 - noise_std * 2.0
     noise_score = clamp100(noise_score)
 
-    # texture proxy (how much high-frequency detail exists)
-    lap = cv2.Laplacian(gray, cv2.CV_32F)
-    texture = float(np.mean(np.abs(lap)))
+    # optional texture proxy (keep but not required)
+    texture = float(np.std(cv2.Laplacian(gray, cv2.CV_32F)))
 
     return noise_score, {
-        "noise_std": noise_std,
-        "snr": snr,
-        "texture": texture
+        "noise_std": round(noise_std, 6),
+        "snr": round(snr, 6),
+        "texture": round(texture, 6)
     }
 
 
-# ------------------------------------------------------------
-# Cinematography Analysis (depth cues)
-# ------------------------------------------------------------
+# =============================
+# Cinematography Analysis
+# =============================
 
 def analyze_cinematography(image_bgr):
     img = safe_resize_for_speed(image_bgr, max_dim=1280)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
 
-    # 1) Subject separation (center vs outer)
     center, (x0, y0, cw, ch) = central_roi(gray, frac=0.45)
     outer_mask = outer_ring_mask(h, w, inner_frac=0.55)
 
@@ -366,7 +285,6 @@ def analyze_cinematography(image_bgr):
     sep_raw = center_std - outer_std
     subject_separation = clamp01((sep_raw + 15.0) / 40.0) * 100.0
 
-    # 2) Background blur estimation (Laplacian variance)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     lap_abs = np.abs(lap)
 
@@ -379,7 +297,6 @@ def analyze_cinematography(image_bgr):
     blur_ratio = (outer_sharp + 1e-6) / (center_sharp + 1e-6)
     background_blur = clamp01((1.10 - blur_ratio) / (1.10 - 0.35)) * 100.0
 
-    # 3) Lighting depth
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(gx, gy)
@@ -392,7 +309,6 @@ def analyze_cinematography(image_bgr):
     modeling = clamp01((mag_mean - 6.0) / 18.0) * 0.45 + clamp01((spread - 30.0) / 80.0) * 0.55
     lighting_depth = clamp100(modeling * 100.0)
 
-    # 4) Directionality
     thresh = float(np.percentile(gray, 95))
     bright_mask = (gray >= thresh).astype(np.uint8)
     ys, xs = np.where(bright_mask > 0)
@@ -407,7 +323,6 @@ def analyze_cinematography(image_bgr):
         bright_offset = float(np.sqrt(dx * dx + dy * dy))
         directionality = clamp100(35.0 + clamp01(bright_offset / 0.6) * 65.0)
 
-    # 5) Layer complexity
     edges = cv2.Canny(gray, 60, 160)
 
     mask_center = np.zeros((h, w), dtype=np.uint8)
@@ -436,10 +351,10 @@ def analyze_cinematography(image_bgr):
 
     cinematography_score = (
         subject_separation * 0.26 +
-        lighting_depth       * 0.26 +
-        background_blur      * 0.18 +
-        layer_complexity     * 0.16 +
-        directionality       * 0.14
+        lighting_depth     * 0.26 +
+        background_blur    * 0.18 +
+        layer_complexity   * 0.16 +
+        directionality     * 0.14
     )
     cinematography_score = clamp100(cinematography_score)
 
@@ -457,196 +372,181 @@ def analyze_cinematography(image_bgr):
     }
 
 
-# ------------------------------------------------------------
-# Composition (rule of thirds + balance + negative space + FIXED TILT)
-# Fix: tilt_score must NOT invert meaning; compute degrees from dominant near-horizontal lines
-# ------------------------------------------------------------
+# =============================
+# Composition Analysis (tilt fixed)
+# =============================
 
 def analyze_composition(image_bgr):
-    img = safe_resize_for_speed(image_bgr, max_dim=1400)
+    img = safe_resize_for_speed(image_bgr, max_dim=1280)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
 
-    # Edge map for geometry
     edges = cv2.Canny(gray, 60, 160)
 
-    # --- Tilt / horizon estimation (Hough)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                            minLineLength=int(min(w, h) * 0.20),
-                            maxLineGap=20)
-
-    tilt_deg = 0.0
-    if lines is not None and len(lines) > 0:
-        angles = []
-        for l in lines[:300]:
-            x1, y1, x2, y2 = l[0]
-            dx = float(x2 - x1)
-            dy = float(y2 - y1)
-            if abs(dx) < 1e-3:
-                continue
-            ang = np.degrees(np.arctan2(dy, dx))  # -180..180
-            # bring angle to [-90..90]
-            if ang > 90:
-                ang -= 180
-            if ang < -90:
-                ang += 180
-            # keep only near-horizontal lines (most indicative of tilt)
-            if abs(ang) <= 20:
-                length = np.hypot(dx, dy)
-                angles.append((ang, length))
-
-        if len(angles) >= 3:
-            # weighted median-ish: sort by angle, weight by length
-            angles_sorted = sorted(angles, key=lambda x: x[0])
-            total_w = sum(a[1] for a in angles_sorted) + 1e-6
-            cum = 0.0
-            med = angles_sorted[0][0]
-            for ang, wgt in angles_sorted:
-                cum += wgt
-                if cum >= total_w * 0.5:
-                    med = ang
-                    break
-            tilt_deg = float(abs(med))
-        else:
-            tilt_deg = 0.0
-
-    # Tilt score: 0deg => 100. 5deg => ~0-20 penalty. 10deg => strong penalty.
-    tilt_score = clamp100(100.0 - tilt_deg * 12.0)
-
-    # --- Subject proxy: use saliency-like center of edges (simple)
+    # edge energy centroid (simple "subject" proxy)
     ys, xs = np.where(edges > 0)
-    if xs.size < 50:
-        cx, cy = w // 2, h // 2
-        edge_density = 0.0
+    if xs.size < 200:
+        cx, cy = (w // 2), (h // 2)
     else:
         cx = int(np.mean(xs))
         cy = int(np.mean(ys))
-        edge_density = float(xs.size / (w * h))
 
-    # Rule of thirds score: distance of (cx,cy) from nearest thirds intersection
-    thirds_x = [w / 3.0, 2.0 * w / 3.0]
-    thirds_y = [h / 3.0, 2.0 * h / 3.0]
-    pts = [(tx, ty) for tx in thirds_x for ty in thirds_y]
-    d = min(np.hypot(cx - tx, cy - ty) for tx, ty in pts)
-    d_norm = d / (np.hypot(w, h) + 1e-6)
-    rule_of_thirds = clamp100(100.0 - d_norm * 260.0)
+    # rule of thirds score: distance to nearest thirds intersection
+    thirds = [
+        (w / 3.0, h / 3.0), (2 * w / 3.0, h / 3.0),
+        (w / 3.0, 2 * h / 3.0), (2 * w / 3.0, 2 * h / 3.0)
+    ]
+    dists = [np.hypot(cx - tx, cy - ty) for (tx, ty) in thirds]
+    dmin = float(min(dists))
+    # normalize by diagonal
+    diag = float(np.hypot(w, h)) + 1e-6
+    rule_of_thirds = clamp100((1.0 - (dmin / (0.55 * diag))) * 100.0)
 
-    # Balance: compare left/right edge energy
-    left = edges[:, :w // 2]
-    right = edges[:, w // 2:]
-    eL = float(np.count_nonzero(left))
-    eR = float(np.count_nonzero(right))
-    bal = 1.0 - (abs(eL - eR) / (eL + eR + 1e-6))
-    balance = clamp100(bal * 100.0)
+    # balance: left vs right edge energy
+    left_energy = float(np.mean(edges[:, :w // 2] > 0))
+    right_energy = float(np.mean(edges[:, w // 2:] > 0))
+    balance = clamp100((1.0 - min(1.0, abs(left_energy - right_energy) / 0.08)) * 100.0)
 
-    # Negative space proxy: how much of frame is "low edge"
-    # If edges sparse => more negative space (can be good)
-    negative_space = clamp100((1.0 - clamp01(edge_density / 0.08)) * 100.0)
+    # negative space: low edge density overall (more "clean" frame)
+    edge_density = float(np.mean(edges > 0))
+    negative_space = clamp100((1.0 - min(1.0, edge_density / 0.12)) * 100.0)
 
-    # Final composition score (simple)
+    # tilt detection via Hough lines, focus on near-horizontal segments
+    tilt_deg = 0.0
+    tilt_score = 100.0
+
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold=80, minLineLength=80, maxLineGap=10)
+    if lines is not None and len(lines) > 0:
+        angles = []
+        weights = []
+        for l in lines[:, 0]:
+            x1, y1, x2, y2 = l
+            dx = (x2 - x1)
+            dy = (y2 - y1)
+            length = float(np.hypot(dx, dy))
+            if length < 60:
+                continue
+            angle = np.degrees(np.arctan2(dy, dx))  # -180..180
+            # map to [-90..90]
+            if angle > 90:
+                angle -= 180
+            if angle < -90:
+                angle += 180
+
+            # keep near-horizontal lines for "horizon" tilt (|angle| <= 25 deg)
+            if abs(angle) <= 25:
+                angles.append(angle)
+                weights.append(length)
+
+        if len(angles) >= 2:
+            angles = np.array(angles, dtype=np.float32)
+            weights = np.array(weights, dtype=np.float32)
+            # weighted median-ish: sort by angle then cumulative weights
+            idx = np.argsort(angles)
+            angles_s = angles[idx]
+            weights_s = weights[idx]
+            cw = np.cumsum(weights_s)
+            mid = cw[-1] * 0.5
+            k = int(np.searchsorted(cw, mid))
+            tilt_deg = float(angles_s[min(k, len(angles_s) - 1)])
+        elif len(angles) == 1:
+            tilt_deg = float(angles[0])
+
+        # score: 0deg => 100, 5deg => ~60, 10deg => ~20, cap
+        tilt_score = clamp100(100.0 - abs(tilt_deg) * 8.0)
+
+    # composition score (rough)
     comp_score = clamp100(
-        rule_of_thirds * 0.40 +
+        rule_of_thirds * 0.35 +
         balance        * 0.25 +
-        negative_space * 0.20 +
+        negative_space * 0.25 +
         tilt_score     * 0.15
     )
 
-    return comp_score, {
-        "rule_of_thirds": float(round(rule_of_thirds, 2)),
-        "balance": float(round(balance, 2)),
-        "negative_space": float(round(negative_space, 2)),
-        "tilt_degrees": float(round(tilt_deg, 3)),
-        "tilt_score": float(round(tilt_score, 2)),
-        "edge_density": float(round(edge_density, 6)),
+    metrics = {
         "subject_position": {"x": int(cx), "y": int(cy)},
+        "edge_density": round(edge_density, 6),
+        "tilt_deg": round(float(tilt_deg), 3),
+        "tilt_score": round(float(tilt_score), 1),
+        "rule_of_thirds": round(float(rule_of_thirds), 2),
+        "balance": round(float(balance), 2),
+        "negative_space": round(float(negative_space), 2),
     }
+    return comp_score, metrics
 
 
-# ------------------------------------------------------------
-# Suggestions Engine (now driven by Exposure v2 + Color v2)
-# ------------------------------------------------------------
+# =============================
+# Suggestions Engine
+# =============================
 
 def build_suggestions(exposure_metrics, color_metrics, cine_metrics, comp_metrics):
-    suggestions = []
+    s = []
 
-    # Exposure suggestions
+    # Exposure suggestions (fixed: overexposed vs underexposed)
     state = exposure_metrics.get("state", "ok")
-    hi_clip = float(exposure_metrics.get("highlight_clip_ratio", 0.0))
-    lo_clip = float(exposure_metrics.get("shadow_clip_ratio", 0.0))
-    p95 = float(exposure_metrics.get("p95", 0.0))
-    p5 = float(exposure_metrics.get("p5", 0.0))
+    hl_clip = exposure_metrics.get("highlight_clip", 0.0)
+    sh_clip = exposure_metrics.get("shadow_clip", 0.0)
+    p95 = exposure_metrics.get("p95", 0.0)
 
-    if state in ("overexposed", "clipped_both"):
-        msg = "Highlights look pushed/clipped. Lower exposure ~0.5–1 stop and protect highlights (reduce ISO/exposure, add ND, or reposition key light)."
-        if hi_clip >= 0.03 or p95 >= 240:
-            msg = "Highlights are clipping. Reduce exposure ~1 stop and protect whites (ND filter, lower ISO, or reduce key intensity)."
-        suggestions.append({"category": "Exposure", "priority": "high", "message": msg})
+    if state == "overexposed":
+        msg = "Highlights look clipped/too bright. Lower exposure ~0.5–1 stop (or reduce key light) to preserve detail."
+        if hl_clip > 0.03 or p95 > 245:
+            msg = "Highlights are heavily clipped. Lower exposure ~1 stop (or reduce key light) and protect whites to retain texture."
+        s.append({"category": "Exposure", "priority": "high", "message": msg})
 
-    if state in ("underexposed", "clipped_both"):
-        msg = "Shadows are too low/crushed. Raise exposure ~0.5 stop or add fill to lift midtones while keeping contrast."
-        if lo_clip >= 0.05 or p5 <= 10:
-            msg = "Shadows are clipping/crushing. Increase exposure or add soft fill to recover shadow detail."
-        suggestions.append({"category": "Exposure", "priority": "high" if state == "underexposed" else "medium", "message": msg})
+    elif state == "underexposed":
+        msg = "Image looks underexposed. Increase exposure ~0.5–1 stop or add a soft key light to lift midtones without flattening contrast."
+        if sh_clip > 0.03:
+            msg = "Shadows are heavily crushed. Lift exposure or add fill to recover shadow detail while keeping contrast controlled."
+        s.append({"category": "Exposure", "priority": "high", "message": msg})
 
-    # Color temperature / tint suggestions
+    # Color cast suggestions (Lab-based)
+    cast = float(color_metrics.get("cast_strength", 0.0))
     temp = color_metrics.get("temperature", "neutral")
     tint = color_metrics.get("tint", "neutral")
-    cast_strength = float(color_metrics.get("cast_strength", 0.0))
 
-    if cast_strength >= 14.0:
-        # Temperature
+    if cast >= 10.0:
+        parts = []
         if temp == "cool":
-            suggestions.append({
-                "category": "Color",
-                "priority": "high",
-                "message": "Strong cool/blue cast detected. Warm up white balance (increase temperature) and re-check neutrals in highlights."
-            })
+            parts.append("cool/blue")
         elif temp == "warm":
-            suggestions.append({
-                "category": "Color",
-                "priority": "high",
-                "message": "Strong warm/yellow cast detected. Cool down white balance (decrease temperature) and re-check neutrals in highlights."
-            })
-
-        # Tint
+            parts.append("warm/yellow")
         if tint == "green":
-            suggestions.append({
-                "category": "Color",
-                "priority": "high",
-                "message": "Green cast detected. Add a touch of magenta tint (or reduce green in highlights) to neutralize whites."
-            })
+            parts.append("green")
         elif tint == "magenta":
-            suggestions.append({
-                "category": "Color",
-                "priority": "high",
-                "message": "Magenta cast detected. Add a touch of green tint to bring neutrals back to center."
-            })
+            parts.append("magenta")
 
-    # Cinematography / separation suggestion (soft)
-    subj_sep = float(cine_metrics.get("subject_separation", 50.0))
-    bg_blur = float(cine_metrics.get("background_blur", 50.0))
-    if subj_sep < 35.0 and bg_blur < 55.0:
-        suggestions.append({
+        cast_label = " + ".join(parts) if parts else "color"
+        s.append({
+            "category": "Color",
+            "priority": "high" if cast >= 14.0 else "medium",
+            "message": f"Noticeable {cast_label} cast detected. Correct white balance (Temp/Tint) before doing any creative look."
+        })
+
+    # Cinematography: subject separation
+    sep = float(cine_metrics.get("subject_separation", 50.0))
+    if sep < 35.0:
+        s.append({
             "category": "Cinematography",
             "priority": "medium",
             "message": "Subject separation looks limited. Increase subject–background distance, simplify background, or use a longer focal length."
         })
 
-    # Composition / tilt suggestion
-    tilt_deg = float(comp_metrics.get("tilt_degrees", 0.0))
-    if tilt_deg >= 3.5:
-        suggestions.append({
+    # Composition: tilt only if real tilt
+    tilt_deg = float(comp_metrics.get("tilt_deg", 0.0))
+    if abs(tilt_deg) >= 2.0:
+        s.append({
             "category": "Composition",
             "priority": "medium",
-            "message": "Horizon/lines appear tilted. Level the shot (or correct rotation in post) to improve perceived professionalism."
+            "message": f"Horizon/lines appear tilted (~{abs(tilt_deg):.1f}°). Level the shot (or correct rotation in post) to improve perceived professionalism."
         })
 
-    return suggestions
+    return s
 
 
-# ------------------------------------------------------------
+# =============================
 # Main Endpoint
-# ------------------------------------------------------------
+# =============================
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
@@ -657,48 +557,49 @@ async def analyze(file: UploadFile = File(...)):
     if image is None:
         return {"ok": False, "error": "Invalid image"}
 
-    # Core analysis
-    exposure_score, exposure_metrics = analyze_exposure_v2(image)
+    # analyses
+    exposure_score, exposure_metrics = analyze_exposure(image)
     contrast_score, contrast_value = analyze_contrast(image)
-    color_score, color_metrics = analyze_color_balance_v2(image)
+    color_score, color_metrics = analyze_color_balance(image)
     skin_score, skin_metrics = analyze_skin(image)
     noise_score, noise_metrics = analyze_noise(image)
     cine_score, cine_metrics = analyze_cinematography(image)
     comp_score, comp_metrics = analyze_composition(image)
 
-    # Overall score (acquisition-focused: "how cinematic is the image you captured")
+    suggestions = build_suggestions(exposure_metrics, color_metrics, cine_metrics, comp_metrics)
+
+    # Overall cinematic score (acquisition-focused)
     cinematic_score = int(
         (exposure_score * 0.22) +
         (contrast_score * 0.14) +
         (color_score * 0.16) +
-        (skin_score * 0.12) +
-        (noise_score * 0.12) +
-        (cine_score * 0.16) +
-        (comp_score * 0.08)
+        (skin_score * 0.14) +
+        (noise_score * 0.10) +
+        (cine_score * 0.14) +
+        (comp_score * 0.10)
     )
-
-    suggestions = build_suggestions(exposure_metrics, color_metrics, cine_metrics, comp_metrics)
 
     return {
         "ok": True,
         "score": cinematic_score,
         "breakdown": {
-            "exposure": float(round(exposure_score, 2)),
-            "contrast": float(round(contrast_score, 2)),
-            "color": float(round(color_score, 2)),
-            "skin": float(round(skin_score, 2)),
-            "noise": float(round(noise_score, 2)),
-            "cinematography": float(round(cine_score, 2)),
-            "composition": float(round(comp_score, 2)),
+            "exposure": round(exposure_score, 1),
+            "contrast": round(contrast_score, 1),
+            "color": round(color_score, 1),
+            "skin": round(skin_score, 1),
+            "noise": round(noise_score, 1),
+            "cinematography": round(cine_score, 1),
+            "composition": round(comp_score, 1),
         },
         "metrics": {
-            "exposure": exposure_metrics,                # includes state + clipping + percentiles
-            "contrast_std": float(round(contrast_value, 4)),
-            "color": color_metrics,                      # includes temperature + tint + highlight-weighted Lab
+            # exposure metrics now include state + clipping
+            "exposure": exposure_metrics,
+            "contrast": round(float(contrast_value), 6),
+            "color": color_metrics,
             "skin": skin_metrics,
             "noise": noise_metrics,
             "cinematography": cine_metrics,
-            "composition": comp_metrics,                 # includes tilt_degrees + tilt_score (fixed meaning)
+            "composition": comp_metrics
         },
         "suggestions": suggestions
     }
