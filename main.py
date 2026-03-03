@@ -1,553 +1,349 @@
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Barlow:wght@300;400;500;600;700;800&family=Barlow+Condensed:wght@400;600;700;800&display=swap');
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
+import cv2
+import math
 
-  :root {
-    --black:      #080808;
-    --surface:    #111111;
-    --surface2:   #181818;
-    --border:     rgba(255,255,255,0.07);
-    --border-hi:  rgba(255,255,255,0.13);
-    --text:       #f2f2f2;
-    --muted:      rgba(242,242,242,0.45);
-    --dim:        rgba(242,242,242,0.22);
-    --gold:       #d4b483;
-    --gold-glow:  rgba(212,180,131,0.10);
-    --red:        #ff4d4d;
-    --orange:     #ff9940;
-    --blue:       #4fb3ff;
-    --green:      #3ddc84;
-    --red-bg:     rgba(255,77,77,0.07);
-    --orange-bg:  rgba(255,153,64,0.07);
-    --blue-bg:    rgba(79,179,255,0.07);
-  }
+app = FastAPI()
 
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-  .cm {
-    font-family: 'Barlow', sans-serif;
-    background: var(--black);
-    color: var(--text);
-    -webkit-font-smoothing: antialiased;
-  }
+@app.get("/")
+def root():
+    return {"service": "cinemind-api-v5.1"}
 
-  /* ── HEADER ── */
-  .cm-header {
-    padding: 64px 24px 48px;
-    text-align: center;
-    position: relative;
-    overflow: hidden;
-  }
-  .cm-header::before {
-    content: '';
-    position: absolute; inset: 0;
-    background: radial-gradient(ellipse 70% 55% at 50% 0%, rgba(212,180,131,0.08) 0%, transparent 65%);
-    pointer-events: none;
-  }
-  .cm-logo {
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 0.25em;
-    text-transform: uppercase;
-    color: var(--gold);
-    margin-bottom: 22px;
-    opacity: 0;
-    animation: fadeUp .5s .05s ease forwards;
-  }
-  .cm-logo span {
-    display: inline-block;
-    width: 5px; height: 5px;
-    background: var(--gold);
-    border-radius: 50%;
-    vertical-align: middle;
-    margin: 0 10px 2px;
-    box-shadow: 0 0 8px var(--gold);
-  }
-  .cm-headline {
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: clamp(36px, 6.5vw, 68px);
-    font-weight: 800;
-    line-height: 1.0;
-    letter-spacing: -0.01em;
-    text-transform: uppercase;
-    margin-bottom: 16px;
-    opacity: 0;
-    animation: fadeUp .55s .12s ease forwards;
-  }
-  .cm-headline .line2 {
-    display: block;
-    color: var(--gold);
-  }
-  .cm-desc {
-    max-width: 520px;
-    margin: 0 auto 40px;
-    font-size: 15px;
-    font-weight: 300;
-    line-height: 1.65;
-    color: var(--muted);
-    opacity: 0;
-    animation: fadeUp .55s .2s ease forwards;
-  }
-  .cm-desc strong { color: var(--text); font-weight: 500; }
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "cinemind-api-v5.1"}
 
-  /* ── UPLOAD ZONE ── */
-  .cm-upload-wrap {
-    max-width: 680px;
-    margin: 0 auto;
-    opacity: 0;
-    animation: fadeUp .55s .28s ease forwards;
-  }
-  .cm-drop-zone {
-    position: relative;
-    border: 1.5px dashed var(--border-hi);
-    border-radius: 14px;
-    padding: 44px 32px;
-    cursor: pointer;
-    background: rgba(255,255,255,0.012);
-    transition: border-color .2s, background .2s, transform .2s;
-    text-align: center;
-    margin-bottom: 20px;
-  }
-  .cm-drop-zone input[type=file] {
-    position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
-  }
-  .cm-drop-zone:hover, .cm-drop-zone.drag-on {
-    border-color: var(--gold);
-    background: var(--gold-glow);
-    transform: translateY(-2px);
-  }
-  .cm-drop-icon {
-    width: 40px; height: 40px; margin: 0 auto 14px; color: var(--gold); opacity: .65;
-  }
-  .cm-drop-title { font-size: 15px; font-weight: 600; margin-bottom: 5px; }
-  .cm-drop-sub   { font-size: 13px; color: var(--muted); }
+def clamp01(x):
+    return float(max(0.0, min(1.0, x)))
 
-  /* ── ANALYZE BUTTON ── */
-  .cm-btn {
-    width: 100%;
-    display: flex; align-items: center; justify-content: center; gap: 9px;
-    background: var(--gold);
-    color: #1a1208;
-    border: none;
-    padding: 16px 28px;
-    font-family: 'Barlow', sans-serif;
-    font-size: 15px;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    border-radius: 10px;
-    cursor: pointer;
-    transition: transform .18s, box-shadow .18s, opacity .18s;
-    box-shadow: 0 0 28px rgba(212,180,131,.16), 0 4px 14px rgba(0,0,0,.4);
-    position: relative; overflow: hidden;
-  }
-  .cm-btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 0 42px rgba(212,180,131,.26), 0 8px 20px rgba(0,0,0,.5); }
-  .cm-btn:active:not(:disabled) { transform: scale(.98); }
-  .cm-btn:disabled { opacity: .45; cursor: not-allowed; }
-  .cm-btn-shine {
-    position: absolute; top: 0; left: -100%; width: 55%; height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,.22), transparent);
-    transform: skewX(-18deg);
-  }
-  .cm-btn:hover:not(:disabled) .cm-btn-shine { animation: shine .55s ease forwards; }
-  @keyframes shine { to { left: 150%; } }
+def clamp100(x):
+    return float(max(0.0, min(100.0, x)))
 
-  /* ── STATUS ── */
-  .cm-status {
-    margin-top: 18px; min-height: 20px;
-    display: flex; align-items: center; justify-content: center; gap: 8px;
-    font-size: 13px; color: var(--muted);
-  }
-  .cm-spin {
-    width: 15px; height: 15px; flex-shrink: 0;
-    border: 2px solid rgba(212,180,131,.18); border-top-color: var(--gold);
-    border-radius: 50%; animation: spin .65s linear infinite;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
+def safe_resize_for_speed(img, max_dim=1280):
+    h, w = img.shape[:2]; m = max(h, w)
+    if m <= max_dim: return img
+    s = max_dim / m
+    return cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
 
-  /* ── RESULTS ── */
-  .cm-results { max-width: 720px; margin: 0 auto; padding: 0 20px 80px; display: none; }
-  .cm-results.on { display: block; }
+def central_roi(gray, frac=0.45):
+    h, w = gray.shape[:2]; ch = int(h*frac); cw = int(w*frac)
+    y0 = (h-ch)//2; x0 = (w-cw)//2
+    return gray[y0:y0+ch, x0:x0+cw], (x0, y0, cw, ch)
 
-  /* ── UPLOADED IMAGE ── */
-  .cm-image-block {
-    margin-bottom: 24px;
-    border-radius: 14px;
-    overflow: hidden;
-    border: 1px solid var(--border-hi);
-    background: var(--surface);
-    position: relative;
-  }
-  .cm-image-block img {
-    width: 100%; display: block;
-    max-height: 480px; object-fit: contain;
-    background: #0d0d0d;
-  }
-  .cm-image-label {
-    position: absolute; bottom: 12px; left: 12px;
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 11px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase;
-    color: var(--muted);
-    background: rgba(0,0,0,.55); backdrop-filter: blur(6px);
-    padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border);
-  }
+def outer_ring_mask(h, w, inner_frac=0.55):
+    mask = np.ones((h,w), dtype=np.uint8)
+    ch = int(h*inner_frac); cw = int(w*inner_frac)
+    y0=(h-ch)//2; x0=(w-cw)//2; mask[y0:y0+ch, x0:x0+cw]=0
+    return mask
 
-  /* ── SCORE ── */
-  .cm-score-card {
-    background: var(--surface); border: 1px solid var(--border-hi);
-    border-radius: 16px; padding: 36px 28px; text-align: center;
-    margin-bottom: 16px; position: relative; overflow: hidden;
-  }
-  .cm-score-card::before {
-    content: ''; position: absolute; top: -50px; left: 50%; transform: translateX(-50%);
-    width: 260px; height: 160px;
-    background: radial-gradient(ellipse, rgba(212,180,131,.09) 0%, transparent 70%);
-    pointer-events: none;
-  }
-  .cm-score-badge {
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 11px; font-weight: 700; letter-spacing: .2em; text-transform: uppercase;
-    color: var(--muted); margin-bottom: 10px;
-  }
-  .cm-score-scene {
-    font-size: 11px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase;
-    color: var(--gold); margin-bottom: 12px; opacity: .75;
-  }
-  .cm-score-num {
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: clamp(72px,14vw,100px); font-weight: 800;
-    line-height: 1; letter-spacing: -.02em; color: var(--gold);
-  }
-  .cm-score-num sup { font-size: .32em; color: var(--muted); vertical-align: top; margin-top: .55em; font-weight: 600; }
-  .cm-score-bar-wrap { max-width: 300px; margin: 20px auto 0; height: 3px; background: rgba(255,255,255,.05); border-radius: 2px; overflow: hidden; }
-  .cm-score-bar { height: 100%; border-radius: 2px; background: linear-gradient(90deg, var(--gold), #fff0d0); width: 0%; transition: width 1s cubic-bezier(.16,1,.3,1); box-shadow: 0 0 10px rgba(212,180,131,.5); }
 
-  /* ── BREAKDOWN ── */
-  .cm-section-label {
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 11px; font-weight: 700; letter-spacing: .2em; text-transform: uppercase;
-    color: var(--dim); margin-bottom: 12px; padding-left: 2px;
-  }
-  .cm-grid {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(150px,1fr));
-    gap: 10px; margin-bottom: 16px;
-  }
-  .cm-metric {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 16px 14px;
-    opacity: 0; transform: translateY(10px);
-    transition: opacity .4s, transform .4s, border-color .2s;
-  }
-  .cm-metric.on { opacity: 1; transform: none; }
-  .cm-metric:hover { border-color: var(--border-hi); }
-  .cm-metric-label {
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
-    color: var(--muted); margin-bottom: 8px;
-  }
-  .cm-metric-val {
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 34px; font-weight: 800; line-height: 1; letter-spacing: -.01em;
-    margin-bottom: 9px;
-  }
-  .cm-bar-wrap { height: 3px; background: rgba(255,255,255,.06); border-radius: 2px; overflow: hidden; }
-  .cm-bar { height: 100%; border-radius: 2px; width: 0%; transition: width .85s cubic-bezier(.16,1,.3,1); }
+# ── Scene Type Detection ──────────────────────────────────────────────────────
 
-  .hi .cm-metric-val { color: var(--green); }
-  .hi .cm-bar        { background: var(--green); box-shadow: 0 0 7px rgba(61,220,132,.4); }
-  .md .cm-metric-val { color: var(--orange); }
-  .md .cm-bar        { background: var(--orange); box-shadow: 0 0 7px rgba(255,153,64,.4); }
-  .lo .cm-metric-val { color: var(--red); }
-  .lo .cm-bar        { background: var(--red); box-shadow: 0 0 7px rgba(255,77,77,.4); }
+def detect_scene_type(image_bgr) -> dict:
+    """
+    'subject' = person/face in frame  |  'ambient' = no person detected
 
-  /* ── DIVIDER ── */
-  .cm-div { height: 1px; background: var(--border); margin: 24px 0; }
+    Uses Haar face detection + skin ratio fallback (>5% = person present).
+    This drives: whether skin metric is computed, cinematography weighting,
+    suggestion logic, and final score weighting.
+    """
+    img = safe_resize_for_speed(image_bgr, max_dim=1280)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-  /* ── SUGGESTIONS ── */
-  .cm-sug-card {
-    display: flex; gap: 14px; align-items: flex-start;
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 18px; margin-bottom: 10px;
-    opacity: 0; transform: translateY(8px);
-    transition: opacity .4s, transform .4s, border-color .2s;
-  }
-  .cm-sug-card.on { opacity: 1; transform: none; }
-  .cm-sug-card:hover { border-color: var(--border-hi); }
-  .cm-sug-card.p-high   { border-left: 2px solid var(--red);    background: linear-gradient(135deg, var(--red-bg) 0%, var(--surface) 45%); }
-  .cm-sug-card.p-medium { border-left: 2px solid var(--orange); background: linear-gradient(135deg, var(--orange-bg) 0%, var(--surface) 45%); }
-  .cm-sug-card.p-low    { border-left: 2px solid var(--blue);   background: linear-gradient(135deg, var(--blue-bg) 0%, var(--surface) 45%); }
-  .cm-sug-icon {
-    flex-shrink: 0; width: 32px; height: 32px; border-radius: 8px;
-    display: flex; align-items: center; justify-content: center; font-size: 15px;
-  }
-  .p-high   .cm-sug-icon { background: var(--red-bg);    color: var(--red); }
-  .p-medium .cm-sug-icon { background: var(--orange-bg); color: var(--orange); }
-  .p-low    .cm-sug-icon { background: var(--blue-bg);   color: var(--blue); }
-  .cm-sug-body { flex: 1; }
-  .cm-sug-top { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; flex-wrap: wrap; }
-  .cm-sug-cat { font-size: 13px; font-weight: 700; color: var(--text); }
-  .cm-sug-badge {
-    font-family: 'Barlow Condensed', sans-serif;
-    font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
-    padding: 2px 8px; border-radius: 100px;
-  }
-  .p-high   .cm-sug-badge { background: var(--red-bg);    color: var(--red);    border: 1px solid rgba(255,77,77,.2); }
-  .p-medium .cm-sug-badge { background: var(--orange-bg); color: var(--orange); border: 1px solid rgba(255,153,64,.2); }
-  .p-low    .cm-sug-badge { background: var(--blue-bg);   color: var(--blue);   border: 1px solid rgba(79,179,255,.2); }
-  .cm-sug-msg { font-size: 13px; font-weight: 300; line-height: 1.6; color: rgba(242,242,242,.7); }
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60,60))
+    has_face = len(faces) > 0
 
-  /* ── RAW JSON ── */
-  .cm-raw-btn {
-    display: inline-flex; align-items: center; gap: 6px;
-    background: none; border: 1px solid var(--border); color: var(--muted);
-    font-family: 'Barlow', sans-serif; font-size: 12px; font-weight: 500;
-    padding: 7px 14px; border-radius: 8px; cursor: pointer;
-    transition: border-color .2s, color .2s; margin-bottom: 8px;
-  }
-  .cm-raw-btn:hover { border-color: var(--border-hi); color: var(--text); }
-  .cm-raw-box {
-    display: none; background: var(--surface2); border: 1px solid var(--border);
-    border-radius: 10px; padding: 18px; font-size: 11px;
-    font-family: 'SF Mono','Fira Code',monospace; color: rgba(242,242,242,.45);
-    white-space: pre-wrap; line-height: 1.6; max-height: 280px; overflow-y: auto;
-  }
-  .cm-raw-box.on { display: block; }
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    m1 = cv2.inRange(hsv, np.array([0,15,50],dtype=np.uint8), np.array([25,255,255],dtype=np.uint8))
+    m2 = cv2.inRange(hsv, np.array([170,15,50],dtype=np.uint8), np.array([180,255,255],dtype=np.uint8))
+    skin_ratio = float(np.count_nonzero(cv2.bitwise_or(m1,m2))) / (img.shape[0]*img.shape[1])
 
-  /* ── ANIMATIONS ── */
-  @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(14px); }
-    to   { opacity: 1; transform: none; }
-  }
+    has_subject = has_face or skin_ratio > 0.05
+    return {
+        "scene_type": "subject" if has_subject else "ambient",
+        "has_face": bool(has_face),
+        "skin_ratio": round(skin_ratio, 4),
+    }
 
-  /* ── MOBILE ── */
-  @media (max-width: 500px) {
-    .cm-header { padding: 48px 16px 36px; }
-    .cm-grid { grid-template-columns: repeat(2,1fr); gap: 8px; }
-    .cm-metric { padding: 13px 11px; }
-    .cm-sug-card { padding: 14px; }
-    .cm-image-block img { max-height: 300px; }
-  }
-</style>
 
-<div class="cm">
+# ── Exposure ──────────────────────────────────────────────────────────────────
 
-  <!-- HEADER -->
-  <div class="cm-header">
-    <div class="cm-logo">Cine<span></span>Mind</div>
-    <h1 class="cm-headline">
-      Analyze your shot.<br>
-      <span class="line2">Grade with confidence.</span>
-    </h1>
-    <p class="cm-desc">
-      Upload a <strong>Rec.709 preview screenshot</strong> from your Apple Log footage.
-      CineMind breaks down exposure, color, sharpness, and cinematography —
-      then tells you exactly what to fix before you grade.
-    </p>
+def analyze_exposure(image_bgr):
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.uint8)
+    mean  = float(np.mean(gray))
+    p5    = float(np.percentile(gray,5));  p25 = float(np.percentile(gray,25))
+    p50   = float(np.percentile(gray,50)); p75 = float(np.percentile(gray,75))
+    p95   = float(np.percentile(gray,95)); p99 = float(np.percentile(gray,99))
+    hl_hard = float(np.mean(gray>=250)); hl_soft = float(np.mean(gray>=230))
+    sh_hard = float(np.mean(gray<=5));   sh_soft = float(np.mean(gray<=30))
 
-    <div class="cm-upload-wrap">
-      <div class="cm-drop-zone" id="cmDrop">
-        <input type="file" id="cmFile" accept="image/*">
-        <svg class="cm-drop-icon" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="3" width="34" height="34" rx="7"/>
-          <path d="M20 26V14M14 20l6-6 6 6"/>
-          <path d="M12 32h16" opacity=".4"/>
-        </svg>
-        <div class="cm-drop-title">Drop your screenshot here</div>
-        <div class="cm-drop-sub">or click to browse &nbsp;·&nbsp; JPG, PNG, HEIC</div>
-      </div>
+    state = "ok"
+    if hl_hard>0.005 or hl_soft>0.02 or p75>210 or p95>225: state="overexposed"
+    elif sh_hard>0.01 or sh_soft>0.03 or p25<30 or p50<60:   state="underexposed"
 
-      <button class="cm-btn" id="cmBtn" onclick="cmRun()">
-        <span class="cm-btn-shine"></span>
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="8" cy="8" r="6.5"/>
-          <path d="M8 5.5v2.8l1.8 1.1"/>
-        </svg>
-        Analyze Shot
-      </button>
+    score = 100.0
+    score -= min(50.0, hl_hard*5000); score -= min(30.0, hl_soft*600)
+    score -= min(40.0, sh_hard*4000); score -= min(20.0, sh_soft*400)
+    score -= min(15.0, abs(p50-118)*0.12)
+    return clamp100(score), {
+        "mean":round(mean,2),"p5":round(p5,2),"p25":round(p25,2),"p50":round(p50,2),
+        "p75":round(p75,2),"p95":round(p95,2),"p99":round(p99,2),
+        "highlight_clip":round(hl_hard,6),"highlight_soft":round(hl_soft,6),
+        "shadow_clip":round(sh_hard,6),"shadow_soft":round(sh_soft,6),"state":state,
+    }
 
-      <div class="cm-status" id="cmStatus"></div>
-    </div>
-  </div>
 
-  <!-- RESULTS -->
-  <div class="cm-results" id="cmResults">
+# ── Contrast ─────────────────────────────────────────────────────────────────
 
-    <!-- Uploaded image -->
-    <div class="cm-image-block">
-      <img id="cmPreviewImg" src="" alt="Uploaded shot">
-      <div class="cm-image-label" id="cmImgLabel">—</div>
-    </div>
+def analyze_contrast(image_bgr):
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.uint8)
+    std  = float(np.std(gray))
+    p5   = float(np.percentile(gray,5)); p95 = float(np.percentile(gray,95))
+    usable = p95-p5; hl_soft = float(np.mean(gray>=230))
+    score = clamp100(100-abs(usable-200)*0.5) - min(30, hl_soft*400)
+    return clamp100(score), {"std":round(std,3),"usable_spread":round(usable,2),"p5":round(p5,2),"p95":round(p95,2)}
 
-    <!-- Score -->
-    <div class="cm-score-card">
-      <div class="cm-score-badge">Cinematic Score</div>
-      <div class="cm-score-scene" id="cmSceneTag"></div>
-      <div class="cm-score-num" id="cmScoreNum">—<sup>/100</sup></div>
-      <div class="cm-score-bar-wrap"><div class="cm-score-bar" id="cmScoreBar"></div></div>
-    </div>
 
-    <!-- Breakdown -->
-    <div class="cm-section-label">Breakdown</div>
-    <div class="cm-grid" id="cmGrid"></div>
+# ── Color Balance ─────────────────────────────────────────────────────────────
 
-    <div class="cm-div"></div>
+def analyze_color_balance(image_bgr):
+    b_ch,g_ch,r_ch = cv2.split(image_bgr)
+    rm=float(np.mean(r_ch)); gm=float(np.mean(g_ch)); bm=float(np.mean(b_ch))
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    a_mean = float(np.mean(lab[:,:,1]-128)); b_lab = float(np.mean(lab[:,:,2]-128))
+    lab_cast = float(np.sqrt(a_mean**2+b_lab**2)); rgb_imb = float(np.std([rm,gm,bm]))
+    cyan_proxy=(gm+bm)/2-rm; g_dom=gm-rm; b_dom=bm-rm
 
-    <!-- Suggestions -->
-    <div id="cmSugSection" style="display:none">
-      <div class="cm-section-label">How to improve your shot</div>
-      <div id="cmSugList"></div>
-      <div class="cm-div"></div>
-    </div>
+    temp="neutral"
+    if cyan_proxy>8 and g_dom>10: temp="cool/cyan"
+    elif b_dom>12 and g_dom<5:    temp="cool"
+    elif b_lab<-5:                 temp="cool"
+    elif b_lab>5 or (rm-bm>12 and rm-gm>8): temp="warm"
 
-    <!-- Raw JSON -->
-    <button class="cm-raw-btn" onclick="cmToggleRaw()">
-      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-        <path d="M4 2L1 6l3 4M8 2l3 4-3 4"/>
-      </svg>
-      Raw JSON
-    </button>
-    <div class="cm-raw-box" id="cmRaw"></div>
+    tint="neutral"
+    if a_mean<-5: tint="green"
+    elif a_mean>5: tint="magenta"
 
-  </div>
+    eff = max(lab_cast, rgb_imb*1.5)
+    return clamp100(100-eff*3.5), {
+        "r_mean":round(rm,2),"g_mean":round(gm,2),"b_mean":round(bm,2),
+        "lab_a_mean":round(a_mean,3),"lab_b_mean":round(b_lab,3),
+        "lab_cast":round(lab_cast,3),"rgb_imbalance":round(rgb_imb,3),
+        "effective_cast":round(eff,3),"cyan_proxy":round(cyan_proxy,3),
+        "temperature":temp,"tint":tint,
+    }
 
-</div>
 
-<script>
-const API = "https://cinemind-api-4052.onrender.com/analyze";
+# ── Skin (subject scenes only) ────────────────────────────────────────────────
 
-const ICONS = {
-  exposure:"☀", contrast:"◑", color:"◈", skin:"◉",
-  noise:"∿", sharpness:"◎", cinematography:"▣", composition:"⬡"
-};
-const SUG_ICONS = { Exposure:"☀", Color:"◈", Sharpness:"◎", Cinematography:"▣", Composition:"⬡", Noise:"∿" };
+def analyze_skin(image_bgr):
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    m1=cv2.inRange(hsv,np.array([0,15,50],dtype=np.uint8),np.array([25,255,255],dtype=np.uint8))
+    m2=cv2.inRange(hsv,np.array([170,15,50],dtype=np.uint8),np.array([180,255,255],dtype=np.uint8))
+    mask=cv2.bitwise_or(m1,m2)
+    cnt=int(np.count_nonzero(mask)); ratio=float(cnt/(image_bgr.shape[0]*image_bgr.shape[1]+1e-6))
+    if cnt<80 or ratio<0.008: return 50.0,{"skin_detected":False,"skin_ratio":round(ratio,6)}
+    b_ch,g_ch,r_ch=cv2.split(image_bgr)
+    rm=float(np.mean(r_ch[mask>0])); gm=float(np.mean(g_ch[mask>0])); bm=float(np.mean(b_ch[mask>0]))
+    dev=float(abs(rm-gm)+abs(rm-bm)); score=clamp100(100-dev*0.45)
+    temp="neutral"
+    if rm>bm+18: temp="warm"
+    elif bm>rm+18: temp="cool"
+    return score,{"skin_detected":True,"skin_ratio":round(ratio,6),"r_mean":round(rm,2),"g_mean":round(gm,2),"b_mean":round(bm,2),"temperature":temp,"deviation":round(dev,3)}
 
-function scoreClass(v) { return v>=70?"hi":v>=45?"md":"lo"; }
 
-// ── Drag & drop ──
-const drop = document.getElementById("cmDrop");
-const fileInput = document.getElementById("cmFile");
-drop.addEventListener("dragover",  e=>{e.preventDefault();drop.classList.add("drag-on");});
-drop.addEventListener("dragleave", ()=>drop.classList.remove("drag-on"));
-drop.addEventListener("drop", e=>{
-  e.preventDefault(); drop.classList.remove("drag-on");
-  const f = e.dataTransfer.files[0];
-  if(f&&f.type.startsWith("image/")){
-    const dt=new DataTransfer(); dt.items.add(f); fileInput.files=dt.files;
-  }
-});
+# ── Noise ─────────────────────────────────────────────────────────────────────
 
-// ── Animated counter ──
-function animateNum(target){
-  const el=document.getElementById("cmScoreNum");
-  const bar=document.getElementById("cmScoreBar");
-  const dur=900; const t0=performance.now();
-  function step(now){
-    const t=Math.min((now-t0)/dur,1);
-    const e=1-Math.pow(1-t,3);
-    el.innerHTML=`${Math.round(e*target)}<sup>/100</sup>`;
-    if(t<1)requestAnimationFrame(step);
-  }
-  requestAnimationFrame(step);
-  setTimeout(()=>{bar.style.width=target+"%";},60);
-}
+def analyze_noise(image_bgr):
+    gray=cv2.cvtColor(image_bgr,cv2.COLOR_BGR2GRAY)
+    blur=cv2.GaussianBlur(gray,(5,5),0)
+    ns=float(np.std(gray.astype(np.float32)-blur.astype(np.float32)))
+    snr=float(np.mean(gray))/(ns+1e-6)
+    return clamp100(100-ns*2.5),{"noise_std":round(ns,4),"snr":round(snr,3)}
 
-// ── Build breakdown grid ──
-function buildGrid(bd){
-  const grid=document.getElementById("cmGrid");
-  grid.innerHTML="";
-  Object.entries(bd).forEach(([key,val],i)=>{
-    const cls=scoreClass(val);
-    const card=document.createElement("div");
-    card.className=`cm-metric ${cls}`;
-    card.style.transitionDelay=`${i*55}ms`;
-    card.innerHTML=`
-      <div class="cm-metric-label">${ICONS[key]||"·"} ${key.charAt(0).toUpperCase()+key.slice(1)}</div>
-      <div class="cm-metric-val">${Math.round(val)}</div>
-      <div class="cm-bar-wrap"><div class="cm-bar" data-v="${val}"></div></div>
-    `;
-    grid.appendChild(card);
-    requestAnimationFrame(()=>setTimeout(()=>card.classList.add("on"),i*55+40));
-  });
-  setTimeout(()=>{
-    grid.querySelectorAll(".cm-bar").forEach(b=>b.style.width=b.dataset.v+"%");
-  },180);
-}
 
-// ── Build suggestions ──
-function buildSuggestions(sugs){
-  const sec=document.getElementById("cmSugSection");
-  const list=document.getElementById("cmSugList");
-  if(!sugs||!sugs.length){sec.style.display="none";return;}
-  list.innerHTML="";
-  sugs.forEach((s,i)=>{
-    const card=document.createElement("div");
-    card.className=`cm-sug-card p-${s.priority}`;
-    card.style.transitionDelay=`${i*70}ms`;
-    card.innerHTML=`
-      <div class="cm-sug-icon">${SUG_ICONS[s.category]||"·"}</div>
-      <div class="cm-sug-body">
-        <div class="cm-sug-top">
-          <span class="cm-sug-cat">${s.category}</span>
-          <span class="cm-sug-badge">${s.priority}</span>
-        </div>
-        <div class="cm-sug-msg">${s.message}</div>
-      </div>
-    `;
-    list.appendChild(card);
-    requestAnimationFrame(()=>setTimeout(()=>card.classList.add("on"),i*70+100));
-  });
-  sec.style.display="block";
-}
+# ── Sharpness ─────────────────────────────────────────────────────────────────
 
-// ── Main ──
-async function cmRun(){
-  const file=fileInput.files[0];
-  if(!file){alert("Please upload a screenshot first.");return;}
+def analyze_sharpness(image_bgr):
+    gray=cv2.cvtColor(image_bgr,cv2.COLOR_BGR2GRAY)
+    ls=float(np.std(cv2.Laplacian(gray,cv2.CV_64F)))
+    score=clamp100(math.log1p(ls)/math.log1p(80)*100)
+    state="sharp"
+    if ls<10: state="very_soft"
+    elif ls<20: state="soft"
+    elif ls<40: state="moderate"
+    return score,{"laplacian_std":round(ls,3),"state":state}
 
-  const btn=document.getElementById("cmBtn");
-  const status=document.getElementById("cmStatus");
-  const results=document.getElementById("cmResults");
 
-  btn.disabled=true;
-  results.classList.remove("on");
-  status.innerHTML=`<div class="cm-spin"></div> Waking up API…`;
+# ── Cinematography ────────────────────────────────────────────────────────────
 
-  // Show the preview image immediately
-  const reader=new FileReader();
-  reader.onload=e=>{
-    document.getElementById("cmPreviewImg").src=e.target.result;
-    document.getElementById("cmImgLabel").textContent=file.name;
-  };
-  reader.readAsDataURL(file);
+def analyze_cinematography(image_bgr, scene_type: str):
+    """
+    Subject scenes: full weighting incl. subject_separation + background_blur.
+    Ambient scenes: those metrics are excluded (not meaningful without a subject).
+    Re-weighted to lighting_depth 40% / layer_complexity 35% / directionality 25%.
+    """
+    img=safe_resize_for_speed(image_bgr); gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY); h,w=gray.shape[:2]
+    center,(x0,y0,cw,ch)=central_roi(gray); om=outer_ring_mask(h,w)
+    op=gray[om>0]; cs=float(np.std(center)); os=float(np.std(op)) if op.size>0 else float(np.std(gray))
+    subject_separation=clamp01((cs-os+15)/40)*100
+    lap=np.abs(cv2.Laplacian(gray,cv2.CV_64F))
+    cl=lap[y0:y0+ch,x0:x0+cw]; ol=lap[om>0]
+    cs2=float(np.mean(cl)); os2=float(np.mean(ol)) if ol.size>0 else float(np.mean(lap))
+    background_blur=clamp01((1.10-(os2+1e-6)/(cs2+1e-6))/(1.10-0.35))*100
+    gx=cv2.Sobel(gray,cv2.CV_32F,1,0,ksize=3); gy=cv2.Sobel(gray,cv2.CV_32F,0,1,ksize=3)
+    mag_mean=float(np.mean(cv2.magnitude(gx,gy)))
+    spread=max(0.,float(np.percentile(center,90)-np.percentile(center,10)))
+    lighting_depth=clamp100((clamp01((mag_mean-6)/18)*0.45+clamp01((spread-30)/80)*0.55)*100)
+    thresh=float(np.percentile(gray,95)); bm=(gray>=thresh).astype(np.uint8)
+    ys,xs=np.where(bm>0); boff=0.0
+    if xs.size>=50:
+        dx=(float(np.mean(xs))-w/2)/(w/2); dy=(float(np.mean(ys))-h/2)/(h/2)
+        boff=float(np.sqrt(dx**2+dy**2))
+    directionality=clamp100(35+clamp01(boff/0.6)*65)
+    edges=cv2.Canny(gray,60,160)
+    mc=np.zeros((h,w),dtype=np.uint8); mc[y0:y0+ch,x0:x0+cw]=1
+    mm=np.ones((h,w),dtype=np.uint8); mm[mc>0]=0; mm[om>0]=0
+    def ed(m):
+        p=int(np.count_nonzero(m)); return 0. if p<=0 else float(np.count_nonzero(edges[m>0])/p)
+    p=np.array([ed(mc),ed(mm),ed(om)],dtype=np.float32); p/=(float(np.sum(p))+1e-6)
+    entropy=float(-(p*np.log(p+1e-6)).sum()); layer_complexity=clamp100(clamp01(entropy/1.05)*100)
 
-  const fd=new FormData(); fd.append("file",file);
+    if scene_type=="ambient":
+        score=clamp100(lighting_depth*0.40+layer_complexity*0.35+directionality*0.25)
+    else:
+        score=clamp100(subject_separation*0.26+lighting_depth*0.26+background_blur*0.18+layer_complexity*0.16+directionality*0.14)
 
-  try {
-    status.innerHTML=`<div class="cm-spin"></div> Analyzing…`;
-    const res=await fetch(API,{method:"POST",body:fd});
-    const data=await res.json();
-    if(!data.ok)throw new Error(data.error||"API error");
+    m={"lighting_depth":round(lighting_depth,2),"layer_complexity":round(layer_complexity,2),"directionality":round(directionality,2),"bright_offset":round(boff,4),"bg_sharpness":round(os2,4),"subject_sharpness":round(cs2,4)}
+    if scene_type=="subject":
+        m["subject_separation"]=round(subject_separation,2); m["background_blur"]=round(background_blur,2)
+        m["center_contrast_std"]=round(cs,3); m["outer_contrast_std"]=round(os,3)
+    return score,m
 
-    status.innerHTML="";
-    results.classList.add("on");
 
-    // Scene tag
-    const sceneTag=document.getElementById("cmSceneTag");
-    sceneTag.textContent=data.scene_type==="subject"?"— Subject scene —":"— Ambient scene —";
+# ── Composition ───────────────────────────────────────────────────────────────
 
-    animateNum(data.score);
-    if(data.breakdown) buildGrid(data.breakdown);
-    if(data.suggestions) buildSuggestions(data.suggestions);
-    document.getElementById("cmRaw").textContent=JSON.stringify(data,null,2);
+def analyze_composition(image_bgr):
+    img=safe_resize_for_speed(image_bgr); gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY); h,w=gray.shape[:2]
+    edges=cv2.Canny(gray,60,160); ys,xs=np.where(edges>0)
+    cx=int(np.mean(xs)) if xs.size>=200 else w//2; cy=int(np.mean(ys)) if xs.size>=200 else h//2
+    thirds=[(w/3,h/3),(2*w/3,h/3),(w/3,2*h/3),(2*w/3,2*h/3)]
+    dmin=float(min([np.hypot(cx-tx,cy-ty) for tx,ty in thirds])); diag=float(np.hypot(w,h))+1e-6
+    rot=clamp100((1-(dmin/(0.55*diag)))*100)
+    le=float(np.mean(edges[:,:w//2]>0)); re=float(np.mean(edges[:,w//2:]>0))
+    bal=clamp100((1-min(1,abs(le-re)/0.08))*100)
+    ed=float(np.mean(edges>0)); ns=clamp100((1-min(1,ed/0.12))*100)
+    tilt_deg=0.0
+    lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=80,minLineLength=80,maxLineGap=10)
+    if lines is not None:
+        ah=[]; wh=[]
+        for l in lines[:,0]:
+            x1,y1,x2,y2=l; length=float(np.hypot(x2-x1,y2-y1))
+            if length<60: continue
+            angle=np.degrees(np.arctan2(y2-y1,x2-x1))
+            if angle>90: angle-=180
+            if angle<-90: angle+=180
+            if abs(angle)<=25: ah.append(angle); wh.append(length)
+        if len(ah)>=2: tilt_deg=float(np.average(np.array(ah),weights=np.array(wh)))
+        elif len(ah)==1: tilt_deg=float(ah[0])
+    ts=clamp100(100-abs(tilt_deg)*8)
+    score=clamp100(rot*0.35+bal*0.25+ns*0.25+ts*0.15)
+    return score,{"subject_position":{"x":cx,"y":cy},"edge_density":round(ed,6),"tilt_deg":round(float(tilt_deg),3),"tilt_score":round(float(ts),1),"rule_of_thirds":round(float(rot),2),"balance":round(float(bal),2),"negative_space":round(float(ns),2)}
 
-    setTimeout(()=>results.scrollIntoView({behavior:"smooth",block:"start"}),120);
-  }catch(err){
-    console.error(err);
-    status.innerHTML=`<span style="color:var(--red)">Analysis failed — ${err.message}</span>`;
-  }finally{
-    btn.disabled=false;
-  }
-}
 
-function cmToggleRaw(){ document.getElementById("cmRaw").classList.toggle("on"); }
-</script>
+# ── Suggestions ───────────────────────────────────────────────────────────────
+
+def build_suggestions(exposure_m, color_m, cine_m, comp_m, sharpness_m, scene_info):
+    s=[]; scene_type=scene_info.get("scene_type","subject")
+
+    state=exposure_m.get("state","ok")
+    hl_hard=float(exposure_m.get("highlight_clip",0)); hl_soft=float(exposure_m.get("highlight_soft",0))
+    sh_hard=float(exposure_m.get("shadow_clip",0));   sh_soft=float(exposure_m.get("shadow_soft",0))
+    if state=="overexposed":
+        if hl_hard>0.02: msg="Highlights are heavily clipped. Lower exposure ~1–1.5 stops or reduce key light to recover texture in whites."
+        elif hl_soft>0.05: msg="Image looks washed out / over-bright. Lower exposure ~0.5–1 stop to restore depth and contrast in the highlights."
+        else: msg="Image is slightly overexposed. Reduce exposure ~0.5 stop or protect highlights with a gentle S-curve in grading."
+        s.append({"category":"Exposure","priority":"high","message":msg})
+    elif state=="underexposed":
+        if sh_hard>0.02: msg="Blacks are severely crushed. Lift exposure ~1–1.5 stops or add fill light to recover shadow detail."
+        elif sh_soft>0.05: msg="Image is underexposed with heavy shadows. Increase exposure ~0.5–1 stop or add soft fill to lift midtones."
+        else: msg="Image looks slightly underexposed. Increase exposure ~0.5 stop or raise midtones gently in post."
+        s.append({"category":"Exposure","priority":"high","message":msg})
+
+    eff=float(color_m.get("effective_cast",0)); temp=color_m.get("temperature","neutral"); tint=color_m.get("tint","neutral")
+    if eff>=8.0:
+        parts=[]
+        if temp=="cool/cyan": parts.append("cyan/teal")
+        elif temp=="cool":    parts.append("cool/blue")
+        elif temp=="warm":    parts.append("warm/yellow-orange")
+        if tint=="green":     parts.append("green")
+        elif tint=="magenta": parts.append("magenta")
+        label=" + ".join(parts) if parts else "color"
+        s.append({"category":"Color","priority":"high" if eff>=12 else "medium","message":f"Noticeable {label} cast detected. Correct white balance (Temp/Tint sliders) before applying any creative look."})
+
+    ls=float(sharpness_m.get("laplacian_std",50)); sh_state=sharpness_m.get("state","sharp")
+    if sh_state in ("very_soft","soft"):
+        msg="Image appears very soft or hazy. Check for lens fog, diffusion filter, or significant motion blur. Re-shoot if critical." if ls<8 else "Image looks slightly soft. Ensure subject is in focus and try a faster shutter speed to reduce motion blur."
+        s.append({"category":"Sharpness","priority":"medium","message":msg})
+
+    if scene_type=="subject":
+        sep=float(cine_m.get("subject_separation",50))
+        if sep<35: s.append({"category":"Cinematography","priority":"medium","message":"Subject separation is low. Increase subject–background distance, simplify the background, or use a longer focal length to compress and isolate the subject."})
+    else:
+        layer=float(cine_m.get("layer_complexity",50))
+        if layer<35: s.append({"category":"Cinematography","priority":"low","message":"The scene looks visually flat. Try adding foreground elements, leading lines, or varying depth to create more visual interest."})
+
+    td=float(comp_m.get("tilt_deg",0))
+    if abs(td)>=2.5: s.append({"category":"Composition","priority":"medium","message":f"Horizon/lines appear tilted (~{abs(td):.1f}°). Level the shot in-camera or correct rotation in post for a cleaner, more professional look."})
+    return s
+
+
+# ── Main Endpoint ─────────────────────────────────────────────────────────────
+
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)):
+    contents=await file.read()
+    image=cv2.imdecode(np.frombuffer(contents,np.uint8), cv2.IMREAD_COLOR)
+    if image is None: return {"ok":False,"error":"Invalid image"}
+
+    scene_info=detect_scene_type(image); scene_type=scene_info["scene_type"]
+
+    exposure_score,  exposure_metrics  = analyze_exposure(image)
+    contrast_score,  contrast_metrics  = analyze_contrast(image)
+    color_score,     color_metrics     = analyze_color_balance(image)
+    noise_score,     noise_metrics     = analyze_noise(image)
+    sharpness_score, sharpness_metrics = analyze_sharpness(image)
+    cine_score,      cine_metrics      = analyze_cinematography(image, scene_type)
+    comp_score,      comp_metrics      = analyze_composition(image)
+
+    skin_score=skin_metrics=None
+    if scene_type=="subject":
+        skin_score,skin_metrics=analyze_skin(image)
+
+    suggestions=build_suggestions(exposure_metrics,color_metrics,cine_metrics,comp_metrics,sharpness_metrics,scene_info)
+
+    if scene_type=="subject":
+        cinematic_score=int(exposure_score*0.22+contrast_score*0.12+color_score*0.16+(skin_score or 50)*0.10+noise_score*0.06+sharpness_score*0.08+cine_score*0.14+comp_score*0.12)
+    else:
+        cinematic_score=int(exposure_score*0.22+contrast_score*0.16+color_score*0.20+noise_score*0.06+sharpness_score*0.08+cine_score*0.16+comp_score*0.12)
+
+    breakdown={"exposure":round(exposure_score,1),"contrast":round(contrast_score,1),"color":round(color_score,1)}
+    if scene_type=="subject" and skin_score is not None: breakdown["skin"]=round(skin_score,1)
+    breakdown.update({"noise":round(noise_score,1),"sharpness":round(sharpness_score,1),"cinematography":round(cine_score,1),"composition":round(comp_score,1)})
+
+    metrics={"scene":scene_info,"exposure":exposure_metrics,"contrast":contrast_metrics,"color":color_metrics,"noise":noise_metrics,"sharpness":sharpness_metrics,"cinematography":cine_metrics,"composition":comp_metrics}
+    if scene_type=="subject" and skin_metrics: metrics["skin"]=skin_metrics
+
+    return {"ok":True,"score":cinematic_score,"scene_type":scene_type,"breakdown":breakdown,"metrics":metrics,"suggestions":suggestions}
