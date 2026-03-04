@@ -1,10 +1,89 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-import numpy as np, cv2, math
+import numpy as np, cv2, math, os, base64, json as _json_mod
+import httpx
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
                    allow_methods=["*"], allow_headers=["*"])
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+VISION_PROMPT = """You are an expert cinematographer and colorist analyzing a Rec.709 preview frame from Apple Log footage.
+Analyze this image and respond ONLY with a valid JSON object — no markdown, no preamble, no extra text.
+Return exactly this structure:
+{"light_quality":"hard|soft|mixed","light_motivation":"motivated|unmotivated|unknown","light_description":"one sentence describing the lighting","creative_intent":"one sentence on the apparent creative intent","grade_intent":"neutral|warm|cool|desaturated|stylized","technical_issues":["list of real technical problems, empty if none"],"creative_strengths":["list of genuine creative strengths, empty if none"],"creative_concerns":["list of genuine creative weaknesses, empty if none"],"overall_read":"one sentence summary of the shot quality"}
+Be precise and honest. Only mention what is clearly visible. Max 2 items per list."""
+
+async def analyze_vision(image_bgr) -> dict:
+    if not ANTHROPIC_API_KEY:
+        return {}
+    try:
+        img = image_bgr
+        h, w = img.shape[:2]
+        if max(h, w) > 1024:
+            s = 1024 / max(h, w)
+            img = cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
+        _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        b64 = base64.b64encode(buf.tobytes()).decode()
+        payload = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 500,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": VISION_PROMPT}
+            ]}]
+        }
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json=payload
+            )
+        if resp.status_code != 200:
+            return {}
+        text = resp.json()["content"][0]["text"].strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        return _json_mod.loads(text)
+    except Exception:
+        return {}
+
+def merge_vision_into_creative(creative: dict, vision: dict) -> dict:
+    if not vision:
+        return creative
+    elements = list(creative.get("elements_detected", []))
+    concerns  = list(creative.get("concerns", []))
+    lq = vision.get("light_quality", "")
+    lm = vision.get("light_motivation", "")
+    ld = vision.get("light_description", "")
+    gi = vision.get("grade_intent", "")
+    ci = vision.get("creative_intent", "")
+    if lq == "soft" and lm == "motivated":
+        elements.append({"signal":"vision_light","label":"Soft, motivated lighting","note": ld or "Light feels natural and purposeful."})
+    elif lq == "hard" and lm == "motivated":
+        elements.append({"signal":"vision_light","label":"Hard, motivated lighting","note": ld or "Directional light creates strong shadows and drama."})
+    elif lm == "unmotivated":
+        if not any(c["signal"]=="flat_lighting" for c in concerns):
+            concerns.append({"signal":"vision_light","label":"Unmotivated lighting","note": ld or "Light source unclear from scene context."})
+    for s in vision.get("creative_strengths", [])[:2]:
+        if s and len(s) > 5:
+            elements.append({"signal":"vision_strength","label": s,"note": vision.get("overall_read","")})
+    for c in vision.get("creative_concerns", [])[:2]:
+        if c and len(c) > 5:
+            concerns.append({"signal":"vision_concern","label": c,"note":""})
+    if gi in ("warm","cool","desaturated","stylized") and ci:
+        elements.append({"signal":"vision_intent","label":f"Creative intent: {gi} grade","note": ci})
+    base = float(creative.get("creative_score", 50))
+    bonus = min(len(elements)*3, 12) - min(len(concerns)*2, 8)
+    result = dict(creative)
+    result["elements_detected"] = elements
+    result["concerns"]          = concerns
+    result["creative_score"]    = float(max(0, min(100, base + bonus)))
+    result["vision"] = {"light_quality":lq,"light_motivation":lm,"grade_intent":gi,
+                        "overall_read":vision.get("overall_read",""),
+                        "technical_issues":vision.get("technical_issues",[])}
+    return result
 
 @app.get("/")
 def root(): return {"service": "cinemind-api-v6"}
@@ -486,6 +565,8 @@ async def analyze(file: UploadFile = File(...)):
     skin_s=skin_m=None
     if scene_type=="subject": skin_s,skin_m=analyze_skin(image,ctx)
     creative = analyze_creative(ctx,col_m,cin_m,comp_m)
+    vision   = await analyze_vision(image)
+    creative = merge_vision_into_creative(creative, vision)
     cre_s    = creative["creative_score"]
     suggestions = build_suggestions(exp_m,col_m,cin_m,comp_m,sha_m,ctx,creative)
     if scene_type=="subject":
