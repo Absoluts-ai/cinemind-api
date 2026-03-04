@@ -1,349 +1,505 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-import numpy as np
-import cv2
-import math
+import numpy as np, cv2, math
 
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+                   allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
-def root():
-    return {"service": "cinemind-api-v5.1"}
+def root(): return {"service": "cinemind-api-v6"}
 
 @app.get("/health")
-def health():
-    return {"ok": True, "service": "cinemind-api-v5.1"}
+def health(): return {"ok": True, "service": "cinemind-api-v6"}
 
-def clamp01(x):
-    return float(max(0.0, min(1.0, x)))
+# ── utils ──────────────────────────────────────────────────────────────────
 
-def clamp100(x):
-    return float(max(0.0, min(100.0, x)))
+def clamp(x, lo=0., hi=100.): return float(max(lo, min(hi, x)))
+def clamp01(x): return float(max(0., min(1., x)))
+def lap_std(patch): return float(np.std(cv2.Laplacian(patch.astype(np.uint8), cv2.CV_64F)))
 
-def safe_resize_for_speed(img, max_dim=1280):
+def safe_resize(img, max_dim=1280):
     h, w = img.shape[:2]; m = max(h, w)
     if m <= max_dim: return img
     s = max_dim / m
     return cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
 
 def central_roi(gray, frac=0.45):
-    h, w = gray.shape[:2]; ch = int(h*frac); cw = int(w*frac)
-    y0 = (h-ch)//2; x0 = (w-cw)//2
+    h, w = gray.shape[:2]; ch, cw = int(h*frac), int(w*frac)
+    y0, x0 = (h-ch)//2, (w-cw)//2
     return gray[y0:y0+ch, x0:x0+cw], (x0, y0, cw, ch)
 
-def outer_ring_mask(h, w, inner_frac=0.55):
-    mask = np.ones((h,w), dtype=np.uint8)
-    ch = int(h*inner_frac); cw = int(w*inner_frac)
-    y0=(h-ch)//2; x0=(w-cw)//2; mask[y0:y0+ch, x0:x0+cw]=0
+def outer_mask(h, w, inner_frac=0.55):
+    mask = np.ones((h, w), dtype=np.uint8)
+    ch, cw = int(h*inner_frac), int(w*inner_frac)
+    y0, x0 = (h-ch)//2, (w-cw)//2
+    mask[y0:y0+ch, x0:x0+cw] = 0
     return mask
 
+# ── scene context ──────────────────────────────────────────────────────────
 
-# ── Scene Type Detection ──────────────────────────────────────────────────────
-
-def detect_scene_type(image_bgr) -> dict:
-    """
-    'subject' = person/face in frame  |  'ambient' = no person detected
-
-    Uses Haar face detection + skin ratio fallback (>5% = person present).
-    This drives: whether skin metric is computed, cinematography weighting,
-    suggestion logic, and final score weighting.
-    """
-    img = safe_resize_for_speed(image_bgr, max_dim=1280)
+def build_scene_context(image_bgr):
+    img  = safe_resize(image_bgr)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
 
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60,60))
-    has_face = len(faces) > 0
+    # tonal distribution
+    pct = {p: float(np.percentile(gray, p)) for p in [1,5,10,25,50,75,90,95,99]}
+    dark   = float(np.mean(gray < 64))
+    mid    = float(np.mean((gray >= 64) & (gray <= 192)))
+    bright = float(np.mean(gray > 192))
+    dr     = pct[99] - pct[1]
+    if   dark > 0.40 and bright < 0.20:             lum = "LOW-KEY"
+    elif bright > 0.40 and dark < 0.15:             lum = "HIGH-KEY"
+    elif dr > 150 and dark > 0.15 and bright > 0.10: lum = "CONTRASTY"
+    else:                                             lum = "BALANCED"
+    tonal = {**pct, "dark_mass": round(dark,4), "mid_mass": round(mid,4),
+             "bright_mass": round(bright,4), "dynamic_range": round(dr,1)}
 
+    # face detection
+    fc = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    raw = fc.detectMultiScale(gray, 1.1, 5, minSize=(40,40))
+    faces = [tuple(map(int,f)) for f in raw] if len(raw) > 0 else []
+    largest_face = max(faces, key=lambda f: f[2]*f[3]) if faces else None
+
+    # skin ratio
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    m1 = cv2.inRange(hsv, np.array([0,15,50],dtype=np.uint8), np.array([25,255,255],dtype=np.uint8))
-    m2 = cv2.inRange(hsv, np.array([170,15,50],dtype=np.uint8), np.array([180,255,255],dtype=np.uint8))
-    skin_ratio = float(np.count_nonzero(cv2.bitwise_or(m1,m2))) / (img.shape[0]*img.shape[1])
+    m1 = cv2.inRange(hsv, np.array([0,15,50],   dtype=np.uint8), np.array([25,255,255], dtype=np.uint8))
+    m2 = cv2.inRange(hsv, np.array([170,15,50],  dtype=np.uint8), np.array([180,255,255],dtype=np.uint8))
+    skin_ratio = float(np.count_nonzero(cv2.bitwise_or(m1,m2))) / (h*w)
+    scene_type = "subject" if (len(faces)>0 or skin_ratio>0.05) else "ambient"
 
-    has_subject = has_face or skin_ratio > 0.05
+    # bokeh ratio
+    cy2, cx2 = h//2, w//2; bh, bw = h//3, w//3
+    cp = gray[cy2-bh//2:cy2+bh//2, cx2-bw//2:cx2+bw//2]
+    cs = min(h,w)//6
+    corners = [gray[:cs,:cs], gray[:cs,w-cs:], gray[h-cs:,:cs], gray[h-cs:,w-cs:]]
+    c_lap   = lap_std(cp)
+    crn_lap = float(np.mean([lap_std(c) for c in corners]))
+    bokeh_ratio    = c_lap / (crn_lap + 1e-6)
+    bokeh_detected = bokeh_ratio > 1.8
+
+    # light direction from bright centroid
+    thresh = float(np.percentile(gray, 90))
+    ys, xs = np.where(gray >= thresh)
+    if len(xs) >= 50:
+        lcx = float(np.mean(xs))/w; lcy = float(np.mean(ys))/h
+        if   lcx < 0.35 and lcy < 0.4: ld = "top-left"
+        elif lcx > 0.65 and lcy < 0.4: ld = "top-right"
+        elif lcy < 0.30:                ld = "top"
+        elif lcy > 0.70:                ld = "bottom"
+        elif lcx < 0.35:                ld = "left"
+        elif lcx > 0.65:                ld = "right"
+        else:                           ld = "frontal"
+    else:
+        lcx, lcy, ld = 0.5, 0.5, "unknown"
+
+    # color harmony
+    sat_ch   = hsv[:,:,1]
+    sat_mean = float(np.mean(sat_ch)) / 255.0
+    mask_sat = sat_ch > 60
+    dom_hues = []; harmony = "monochromatic"
+    if np.count_nonzero(mask_sat) > 500:
+        hues_px = hsv[:,:,0][mask_sat].astype(np.int32)
+        hist = np.bincount(hues_px, minlength=180).astype(np.float32)
+        hist /= (hist.sum() + 1e-6)
+        peaks = sorted([(i*2, hist[i]) for i in range(90) if hist[i]>0.04], key=lambda x: -x[1])
+        dom_hues = [p[0] for p in peaks[:3]]
+        if len(dom_hues) >= 2:
+            diff = abs(dom_hues[0]-dom_hues[1]); diff = min(diff, 360-diff)
+            if   diff > 150:          harmony = "complementary"
+            elif diff < 40:           harmony = "analogous"
+            elif 100 < diff < 140:    harmony = "split-complementary"
+            else:                     harmony = "complex"
+
+    # saliency (spectral residual)
+    small    = cv2.resize(gray, (64,64)).astype(np.float32)
+    fft      = np.fft.fft2(small)
+    logamp   = np.log(np.abs(fft)+1e-6)
+    blur_log = cv2.GaussianBlur(logamp.astype(np.float32),(3,3),0)
+    residual = logamp - blur_log
+    sal_fft  = np.exp(residual)*np.exp(1j*np.angle(fft))
+    sal_map  = np.abs(np.fft.ifft2(sal_fft))**2
+    sal_map  = cv2.GaussianBlur(sal_map.astype(np.float32),(5,5),0)
+    sal_map  = cv2.resize(sal_map,(w,h))
+    mn, mx   = sal_map.min(), sal_map.max()
+    sal_norm = (sal_map-mn)/(mx-mn+1e-6)
+    sm = sal_norm > float(np.percentile(sal_norm,85))
+    ys2, xs2 = np.where(sm)
+    sal_cx  = float(np.mean(xs2)/w) if len(xs2)>10 else 0.5
+    sal_cy  = float(np.mean(ys2)/h) if len(xs2)>10 else 0.5
+    sal_spr = float(np.std(xs2)/w + np.std(ys2)/h) if len(xs2)>10 else 0.5
+
+    # lines
+    edges = cv2.Canny(gray, 60, 160)
+    lines = cv2.HoughLinesP(edges,1,np.pi/180,threshold=60,minLineLength=60,maxLineGap=15)
+    diag = horiz = vert = 0
+    if lines is not None:
+        for l in lines[:,0]:
+            x1,y1,x2,y2=l; a=abs(np.degrees(np.arctan2(y2-y1,x2-x1)))
+            if   20<a<70 or 110<a<160: diag+=1
+            elif a<15 or a>165:        horiz+=1
+            elif 75<a<105:             vert+=1
+
     return {
-        "scene_type": "subject" if has_subject else "ambient",
-        "has_face": bool(has_face),
-        "skin_ratio": round(skin_ratio, 4),
+        "scene_type": scene_type, "luminosity_type": lum,
+        "faces": faces, "largest_face": largest_face, "skin_ratio": round(skin_ratio,4),
+        "bokeh_ratio": round(bokeh_ratio,3), "bokeh_detected": bokeh_detected,
+        "light_direction": ld, "light_cx": round(lcx,3), "light_cy": round(lcy,3),
+        "harmony": harmony, "dom_hues": [round(h) for h in dom_hues],
+        "sat_mean": round(sat_mean,4),
+        "saliency_cx": round(sal_cx,3), "saliency_cy": round(sal_cy,3),
+        "saliency_spread": round(sal_spr,3),
+        "diag_lines": diag, "horiz_lines": horiz, "vert_lines": vert,
+        "tonal": tonal, "_img": img,
     }
 
+# ── exposure ───────────────────────────────────────────────────────────────
 
-# ── Exposure ──────────────────────────────────────────────────────────────────
-
-def analyze_exposure(image_bgr):
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.uint8)
-    mean  = float(np.mean(gray))
-    p5    = float(np.percentile(gray,5));  p25 = float(np.percentile(gray,25))
-    p50   = float(np.percentile(gray,50)); p75 = float(np.percentile(gray,75))
-    p95   = float(np.percentile(gray,95)); p99 = float(np.percentile(gray,99))
+def analyze_exposure(image_bgr, ctx):
+    gray    = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.uint8)
+    t       = ctx["tonal"]
     hl_hard = float(np.mean(gray>=250)); hl_soft = float(np.mean(gray>=230))
     sh_hard = float(np.mean(gray<=5));   sh_soft = float(np.mean(gray<=30))
-
-    state = "ok"
-    if hl_hard>0.005 or hl_soft>0.02 or p75>210 or p95>225: state="overexposed"
-    elif sh_hard>0.01 or sh_soft>0.03 or p25<30 or p50<60:   state="underexposed"
-
-    score = 100.0
-    score -= min(50.0, hl_hard*5000); score -= min(30.0, hl_soft*600)
-    score -= min(40.0, sh_hard*4000); score -= min(20.0, sh_soft*400)
-    score -= min(15.0, abs(p50-118)*0.12)
-    return clamp100(score), {
-        "mean":round(mean,2),"p5":round(p5,2),"p25":round(p25,2),"p50":round(p50,2),
-        "p75":round(p75,2),"p95":round(p95,2),"p99":round(p99,2),
+    lum     = ctx["luminosity_type"]
+    state   = "ok"
+    if lum == "LOW-KEY":
+        if hl_hard>0.01  or hl_soft>0.05:          state="overexposed"
+        elif sh_hard>0.03 or t[25]<8:              state="underexposed"
+    elif lum == "HIGH-KEY":
+        if hl_hard>0.003 or hl_soft>0.015 or t[75]>215 or t[95]>228: state="overexposed"
+        elif sh_soft>0.02 or t[50]<80:             state="underexposed"
+    elif lum == "CONTRASTY":
+        if hl_hard>0.01  or hl_soft>0.04:          state="overexposed"
+        elif sh_hard>0.02:                          state="underexposed"
+    else:
+        if hl_hard>0.005 or hl_soft>0.02 or t[75]>210 or t[95]>225: state="overexposed"
+        elif sh_hard>0.01 or sh_soft>0.03 or t[25]<30 or t[50]<60:  state="underexposed"
+    score = 100.
+    score -= clamp(hl_hard*5000,0,50); score -= clamp(hl_soft*400,0,25)
+    score -= clamp(sh_hard*4000,0,40); score -= clamp(sh_soft*300,0,15)
+    if lum in ("BALANCED","HIGH-KEY"): score -= clamp(abs(t[50]-118)*0.10,0,12)
+    return clamp(score), {"state":state,"luminosity_type":lum,
+        "p25":round(t[25],1),"p50":round(t[50],1),"p75":round(t[75],1),"p95":round(t[95],1),
         "highlight_clip":round(hl_hard,6),"highlight_soft":round(hl_soft,6),
-        "shadow_clip":round(sh_hard,6),"shadow_soft":round(sh_soft,6),"state":state,
-    }
+        "shadow_clip":round(sh_hard,6),"shadow_soft":round(sh_soft,6)}
 
+# ── contrast ───────────────────────────────────────────────────────────────
 
-# ── Contrast ─────────────────────────────────────────────────────────────────
+def analyze_contrast(image_bgr, ctx):
+    gray    = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.uint8)
+    std     = float(np.std(gray))
+    t       = ctx["tonal"]; lum = ctx["luminosity_type"]
+    usable  = t[95]-t[5]
+    hl_soft = float(np.mean(gray>=230))
+    target  = {"LOW-KEY":160,"CONTRASTY":200,"HIGH-KEY":130,"BALANCED":190}.get(lum,190)
+    penalty = min(25.,hl_soft*400) if lum in ("BALANCED","HIGH-KEY") else 0
+    return clamp(clamp(100-abs(usable-target)*0.5)-penalty), {
+        "std":round(std,3),"usable_spread":round(usable,2),"target_spread":target,"luminosity_type":lum}
 
-def analyze_contrast(image_bgr):
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.uint8)
-    std  = float(np.std(gray))
-    p5   = float(np.percentile(gray,5)); p95 = float(np.percentile(gray,95))
-    usable = p95-p5; hl_soft = float(np.mean(gray>=230))
-    score = clamp100(100-abs(usable-200)*0.5) - min(30, hl_soft*400)
-    return clamp100(score), {"std":round(std,3),"usable_spread":round(usable,2),"p5":round(p5,2),"p95":round(p95,2)}
+# ── color ──────────────────────────────────────────────────────────────────
 
-
-# ── Color Balance ─────────────────────────────────────────────────────────────
-
-def analyze_color_balance(image_bgr):
+def analyze_color_balance(image_bgr, ctx):
     b_ch,g_ch,r_ch = cv2.split(image_bgr)
     rm=float(np.mean(r_ch)); gm=float(np.mean(g_ch)); bm=float(np.mean(b_ch))
-    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    a_mean = float(np.mean(lab[:,:,1]-128)); b_lab = float(np.mean(lab[:,:,2]-128))
-    lab_cast = float(np.sqrt(a_mean**2+b_lab**2)); rgb_imb = float(np.std([rm,gm,bm]))
+    lab = cv2.cvtColor(image_bgr,cv2.COLOR_BGR2LAB).astype(np.float32)
+    am  = float(np.mean(lab[:,:,1]-128)); bm2=float(np.mean(lab[:,:,2]-128))
+    lab_cast = float(np.sqrt(am**2+bm2**2)); rgb_imb=float(np.std([rm,gm,bm]))
+    eff_cast = max(lab_cast,rgb_imb*1.5)
+    sat_mean = ctx["sat_mean"]; lum = ctx["luminosity_type"]
     cyan_proxy=(gm+bm)/2-rm; g_dom=gm-rm; b_dom=bm-rm
-
     temp="neutral"
-    if cyan_proxy>8 and g_dom>10: temp="cool/cyan"
-    elif b_dom>12 and g_dom<5:    temp="cool"
-    elif b_lab<-5:                 temp="cool"
-    elif b_lab>5 or (rm-bm>12 and rm-gm>8): temp="warm"
-
+    if cyan_proxy>8 and g_dom>10:           temp="cool/cyan"
+    elif b_dom>12 and g_dom<5:              temp="cool"
+    elif bm2<-5:                            temp="cool"
+    elif bm2>5 or (rm-bm>12 and rm-gm>8):  temp="warm"
     tint="neutral"
-    if a_mean<-5: tint="green"
-    elif a_mean>5: tint="magenta"
-
-    eff = max(lab_cast, rgb_imb*1.5)
-    return clamp100(100-eff*3.5), {
+    if am<-5: tint="green"
+    elif am>5: tint="magenta"
+    is_cw = (lum=="LOW-KEY" and temp=="warm" and bm2>3 and am>0)
+    is_cc = (lum in ("LOW-KEY","CONTRASTY") and temp in ("cool","cool/cyan") and eff_cast<18 and sat_mean>0.15)
+    creative_grade = "possible" if (is_cw or is_cc) else "unlikely"
+    if sat_mean < 0.12: eff_cast *= 0.5
+    return clamp(100-eff_cast*3.5), {
         "r_mean":round(rm,2),"g_mean":round(gm,2),"b_mean":round(bm,2),
-        "lab_a_mean":round(a_mean,3),"lab_b_mean":round(b_lab,3),
+        "lab_a_mean":round(am,3),"lab_b_mean":round(bm2,3),
         "lab_cast":round(lab_cast,3),"rgb_imbalance":round(rgb_imb,3),
-        "effective_cast":round(eff,3),"cyan_proxy":round(cyan_proxy,3),
-        "temperature":temp,"tint":tint,
-    }
+        "effective_cast":round(eff_cast,3),"cyan_proxy":round(cyan_proxy,3),
+        "temperature":temp,"tint":tint,"creative_grade":creative_grade,
+        "harmony":ctx["harmony"],"dominant_hues_deg":ctx["dom_hues"]}
 
+# ── skin ───────────────────────────────────────────────────────────────────
 
-# ── Skin (subject scenes only) ────────────────────────────────────────────────
-
-def analyze_skin(image_bgr):
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+def analyze_skin(image_bgr, ctx):
+    hsv=cv2.cvtColor(image_bgr,cv2.COLOR_BGR2HSV)
     m1=cv2.inRange(hsv,np.array([0,15,50],dtype=np.uint8),np.array([25,255,255],dtype=np.uint8))
     m2=cv2.inRange(hsv,np.array([170,15,50],dtype=np.uint8),np.array([180,255,255],dtype=np.uint8))
-    mask=cv2.bitwise_or(m1,m2)
-    cnt=int(np.count_nonzero(mask)); ratio=float(cnt/(image_bgr.shape[0]*image_bgr.shape[1]+1e-6))
-    if cnt<80 or ratio<0.008: return 50.0,{"skin_detected":False,"skin_ratio":round(ratio,6)}
+    mask=cv2.bitwise_or(m1,m2); cnt=int(np.count_nonzero(mask))
+    ratio=float(cnt)/(image_bgr.shape[0]*image_bgr.shape[1]+1e-6)
+    if cnt<80 or ratio<0.008: return 50.,{"skin_detected":False,"skin_ratio":round(ratio,6)}
     b_ch,g_ch,r_ch=cv2.split(image_bgr)
     rm=float(np.mean(r_ch[mask>0])); gm=float(np.mean(g_ch[mask>0])); bm=float(np.mean(b_ch[mask>0]))
-    dev=float(abs(rm-gm)+abs(rm-bm)); score=clamp100(100-dev*0.45)
+    dev=float(abs(rm-gm)+abs(rm-bm)); score=clamp(100-dev*0.45)
     temp="neutral"
     if rm>bm+18: temp="warm"
     elif bm>rm+18: temp="cool"
-    return score,{"skin_detected":True,"skin_ratio":round(ratio,6),"r_mean":round(rm,2),"g_mean":round(gm,2),"b_mean":round(bm,2),"temperature":temp,"deviation":round(dev,3)}
+    return score,{"skin_detected":True,"skin_ratio":round(ratio,6),
+        "r_mean":round(rm,2),"g_mean":round(gm,2),"b_mean":round(bm,2),"temperature":temp,"deviation":round(dev,3)}
 
+# ── noise ──────────────────────────────────────────────────────────────────
 
-# ── Noise ─────────────────────────────────────────────────────────────────────
-
-def analyze_noise(image_bgr):
+def analyze_noise(image_bgr, ctx):
     gray=cv2.cvtColor(image_bgr,cv2.COLOR_BGR2GRAY)
     blur=cv2.GaussianBlur(gray,(5,5),0)
     ns=float(np.std(gray.astype(np.float32)-blur.astype(np.float32)))
     snr=float(np.mean(gray))/(ns+1e-6)
-    return clamp100(100-ns*2.5),{"noise_std":round(ns,4),"snr":round(snr,3)}
+    factor=1.5 if ctx["luminosity_type"]=="LOW-KEY" else 2.0
+    return clamp(100-ns*factor),{"noise_std":round(ns,4),"snr":round(snr,3)}
 
+# ── sharpness ─────────────────────────────────────────────────────────────
 
-# ── Sharpness ─────────────────────────────────────────────────────────────────
-
-def analyze_sharpness(image_bgr):
+def analyze_sharpness(image_bgr, ctx):
+    """
+    Luminance-normalised sharpness.
+    Face present: uses eye-strip ROI (top 60% of face) — most focus-diagnostic zone.
+    Normalises Laplacian by local mean brightness so LOW-KEY scenes compare fairly.
+    Thresholds on norm_lap: very_soft<3  soft<7  moderate<14  sharp>=14
+    """
     gray=cv2.cvtColor(image_bgr,cv2.COLOR_BGR2GRAY)
-    ls=float(np.std(cv2.Laplacian(gray,cv2.CV_64F)))
-    score=clamp100(math.log1p(ls)/math.log1p(80)*100)
-    state="sharp"
-    if ls<10: state="very_soft"
-    elif ls<20: state="soft"
-    elif ls<40: state="moderate"
-    return score,{"laplacian_std":round(ls,3),"state":state}
+    img=safe_resize(gray) if gray.shape[1]>1280 else gray
+    h,w=img.shape[:2]; lf=ctx["largest_face"]; bokeh=ctx["bokeh_detected"]
+    if lf is not None:
+        scale=img.shape[1]/image_bgr.shape[1]
+        fx,fy,fw,fh=int(lf[0]*scale),int(lf[1]*scale),int(lf[2]*scale),int(lf[3]*scale)
+        # Eye strip: top 60% of face height
+        eye_roi=img[max(0,fy):min(h,fy+int(fh*0.60)), max(0,fx):min(w,fx+fw)]
+        full_roi=img[max(0,fy):min(h,fy+fh), max(0,fx):min(w,fx+fw)]
+        roi_mean=float(np.mean(full_roi)) if full_roi.size>0 else 100.
+        ls=lap_std(eye_roi) if eye_roi.size>=200 else lap_std(full_roi)
+        source="eye_strip" if eye_roi.size>=200 else "face_roi"
+        norm_factor=max(0.3, roi_mean/100.)
+        ls_norm=ls/norm_factor
+        if   ls_norm<3:  state="very_soft"
+        elif ls_norm<7:  state="soft"
+        elif ls_norm<14: state="moderate"
+        else:            state="sharp"
+    else:
+        ls=lap_std(img); mean_lum=float(np.mean(img))
+        ls_norm=ls/max(0.3,mean_lum/100.); source="global"
+        if   ls_norm<2:  state="very_soft"
+        elif ls_norm<4:  state="soft"
+        elif ls_norm<8:  state="moderate"
+        else:            state="sharp"
+    score=clamp(math.log1p(ls_norm)/math.log1p(60)*100)
+    return score,{"laplacian_raw":round(ls,3),"laplacian_norm":round(ls_norm,3),
+        "state":state,"source":source,"bokeh_detected":bokeh,"bokeh_ratio":ctx["bokeh_ratio"]}
 
+# ── cinematography ─────────────────────────────────────────────────────────
 
-# ── Cinematography ────────────────────────────────────────────────────────────
-
-def analyze_cinematography(image_bgr, scene_type: str):
-    """
-    Subject scenes: full weighting incl. subject_separation + background_blur.
-    Ambient scenes: those metrics are excluded (not meaningful without a subject).
-    Re-weighted to lighting_depth 40% / layer_complexity 35% / directionality 25%.
-    """
-    img=safe_resize_for_speed(image_bgr); gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY); h,w=gray.shape[:2]
-    center,(x0,y0,cw,ch)=central_roi(gray); om=outer_ring_mask(h,w)
-    op=gray[om>0]; cs=float(np.std(center)); os=float(np.std(op)) if op.size>0 else float(np.std(gray))
-    subject_separation=clamp01((cs-os+15)/40)*100
-    lap=np.abs(cv2.Laplacian(gray,cv2.CV_64F))
-    cl=lap[y0:y0+ch,x0:x0+cw]; ol=lap[om>0]
-    cs2=float(np.mean(cl)); os2=float(np.mean(ol)) if ol.size>0 else float(np.mean(lap))
-    background_blur=clamp01((1.10-(os2+1e-6)/(cs2+1e-6))/(1.10-0.35))*100
+def analyze_cinematography(image_bgr, ctx):
+    img=ctx["_img"]; gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY); h,w=gray.shape[:2]
+    scene=ctx["scene_type"]
+    center,(x0,y0,cw,ch)=central_roi(gray); om=outer_mask(h,w)
+    cs=float(np.std(center)); os_=float(np.std(gray[om>0]))
+    subject_sep=clamp01((cs-os_+15)/40)*100
+    bokeh_iso=clamp(ctx["bokeh_ratio"]/4.0*100)
     gx=cv2.Sobel(gray,cv2.CV_32F,1,0,ksize=3); gy=cv2.Sobel(gray,cv2.CV_32F,0,1,ksize=3)
-    mag_mean=float(np.mean(cv2.magnitude(gx,gy)))
+    mag=float(np.mean(cv2.magnitude(gx,gy)))
     spread=max(0.,float(np.percentile(center,90)-np.percentile(center,10)))
-    lighting_depth=clamp100((clamp01((mag_mean-6)/18)*0.45+clamp01((spread-30)/80)*0.55)*100)
-    thresh=float(np.percentile(gray,95)); bm=(gray>=thresh).astype(np.uint8)
-    ys,xs=np.where(bm>0); boff=0.0
-    if xs.size>=50:
-        dx=(float(np.mean(xs))-w/2)/(w/2); dy=(float(np.mean(ys))-h/2)/(h/2)
-        boff=float(np.sqrt(dx**2+dy**2))
-    directionality=clamp100(35+clamp01(boff/0.6)*65)
+    ld_score=clamp((clamp01((mag-6)/18)*0.45+clamp01((spread-30)/80)*0.55)*100)
+    ld_bonus={"top-left":15,"top-right":15,"left":15,"right":15,"top":5}.get(ctx["light_direction"],0)
+    lighting_depth=clamp(ld_score+ld_bonus)
     edges=cv2.Canny(gray,60,160)
     mc=np.zeros((h,w),dtype=np.uint8); mc[y0:y0+ch,x0:x0+cw]=1
     mm=np.ones((h,w),dtype=np.uint8); mm[mc>0]=0; mm[om>0]=0
     def ed(m):
         p=int(np.count_nonzero(m)); return 0. if p<=0 else float(np.count_nonzero(edges[m>0])/p)
     p=np.array([ed(mc),ed(mm),ed(om)],dtype=np.float32); p/=(float(np.sum(p))+1e-6)
-    entropy=float(-(p*np.log(p+1e-6)).sum()); layer_complexity=clamp100(clamp01(entropy/1.05)*100)
-
-    if scene_type=="ambient":
-        score=clamp100(lighting_depth*0.40+layer_complexity*0.35+directionality*0.25)
+    layer_complexity=clamp(clamp01(float(-(p*np.log(p+1e-6)).sum())/1.05)*100)
+    focal=clamp((1.-clamp01(ctx["saliency_spread"]/0.7))*100)
+    leading=clamp(min(ctx["diag_lines"],40)/40.*100)
+    if scene=="subject":
+        score=clamp(bokeh_iso*0.22+lighting_depth*0.28+layer_complexity*0.14+focal*0.18+leading*0.08+subject_sep*0.10)
     else:
-        score=clamp100(subject_separation*0.26+lighting_depth*0.26+background_blur*0.18+layer_complexity*0.16+directionality*0.14)
-
-    m={"lighting_depth":round(lighting_depth,2),"layer_complexity":round(layer_complexity,2),"directionality":round(directionality,2),"bright_offset":round(boff,4),"bg_sharpness":round(os2,4),"subject_sharpness":round(cs2,4)}
-    if scene_type=="subject":
-        m["subject_separation"]=round(subject_separation,2); m["background_blur"]=round(background_blur,2)
-        m["center_contrast_std"]=round(cs,3); m["outer_contrast_std"]=round(os,3)
+        score=clamp(lighting_depth*0.35+layer_complexity*0.25+leading*0.20+focal*0.20)
+    m={"lighting_depth":round(lighting_depth,2),"layer_complexity":round(layer_complexity,2),
+       "focal_strength":round(focal,2),"leading_lines_score":round(leading,2),
+       "light_direction":ctx["light_direction"],"bokeh_isolation":round(bokeh_iso,2),"bokeh_ratio":ctx["bokeh_ratio"]}
+    if scene=="subject": m["subject_separation"]=round(subject_sep,2)
     return score,m
 
+# ── composition ────────────────────────────────────────────────────────────
 
-# ── Composition ───────────────────────────────────────────────────────────────
-
-def analyze_composition(image_bgr):
-    img=safe_resize_for_speed(image_bgr); gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY); h,w=gray.shape[:2]
-    edges=cv2.Canny(gray,60,160); ys,xs=np.where(edges>0)
-    cx=int(np.mean(xs)) if xs.size>=200 else w//2; cy=int(np.mean(ys)) if xs.size>=200 else h//2
+def analyze_composition(image_bgr, ctx):
+    img=ctx["_img"]; gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY); h,w=gray.shape[:2]
+    edges=cv2.Canny(gray,60,160)
+    cx=int(ctx["saliency_cx"]*w); cy=int(ctx["saliency_cy"]*h)
     thirds=[(w/3,h/3),(2*w/3,h/3),(w/3,2*h/3),(2*w/3,2*h/3)]
-    dmin=float(min([np.hypot(cx-tx,cy-ty) for tx,ty in thirds])); diag=float(np.hypot(w,h))+1e-6
-    rot=clamp100((1-(dmin/(0.55*diag)))*100)
+    dmin=float(min([np.hypot(cx-tx,cy-ty) for tx,ty in thirds]))
+    rot=clamp((1.-dmin/(0.55*float(np.hypot(w,h))+1e-6))*100)
     le=float(np.mean(edges[:,:w//2]>0)); re=float(np.mean(edges[:,w//2:]>0))
-    bal=clamp100((1-min(1,abs(le-re)/0.08))*100)
-    ed=float(np.mean(edges>0)); ns=clamp100((1-min(1,ed/0.12))*100)
-    tilt_deg=0.0
-    lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=80,minLineLength=80,maxLineGap=10)
-    if lines is not None:
-        ah=[]; wh=[]
-        for l in lines[:,0]:
-            x1,y1,x2,y2=l; length=float(np.hypot(x2-x1,y2-y1))
-            if length<60: continue
-            angle=np.degrees(np.arctan2(y2-y1,x2-x1))
-            if angle>90: angle-=180
-            if angle<-90: angle+=180
-            if abs(angle)<=25: ah.append(angle); wh.append(length)
-        if len(ah)>=2: tilt_deg=float(np.average(np.array(ah),weights=np.array(wh)))
-        elif len(ah)==1: tilt_deg=float(ah[0])
-    ts=clamp100(100-abs(tilt_deg)*8)
-    score=clamp100(rot*0.35+bal*0.25+ns*0.25+ts*0.15)
-    return score,{"subject_position":{"x":cx,"y":cy},"edge_density":round(ed,6),"tilt_deg":round(float(tilt_deg),3),"tilt_score":round(float(ts),1),"rule_of_thirds":round(float(rot),2),"balance":round(float(bal),2),"negative_space":round(float(ns),2)}
+    bal=clamp((1.-min(1.,abs(le-re)/0.08))*100)
+    ed=float(np.mean(edges>0)); neg=clamp((1.-min(1.,ed/0.12))*100)
+    conv=clamp(min(ctx["diag_lines"]+ctx["horiz_lines"]*0.3,60)/60.*100)
+    focal=clamp((1.-clamp01(ctx["saliency_spread"]/0.7))*100)
+    tilt=0.
+    _tilt_lines=cv2.HoughLinesP(edges,1,np.pi/180,threshold=60,minLineLength=int(w*0.18),maxLineGap=20)
+    if _tilt_lines is not None:
+        _ta=[]; _tw=[]; _ty=[]
+        for l in _tilt_lines[:,0]:
+            x1,y1,x2,y2=l; ln=float(np.hypot(x2-x1,y2-y1))
+            a=np.degrees(np.arctan2(y2-y1,x2-x1))
+            if a>90: a-=180
+            if a<-90: a+=180
+            if abs(a)<=15: _ta.append(a); _tw.append(ln); _ty.append((y1+y2)/2./h)
+        if len(_ta)>=2:
+            _arr=np.array(_ta); _warr=np.array(_tw); _mpy=np.array(_ty)
+            _tw_total=_warr.sum()
+            _bc=np.arange(-15.5,16.5,1.); _bct=(_bc[:-1]+_bc[1:])/2
+            _wh=np.zeros(len(_bct))
+            for _a,_w in zip(_arr,_warr):
+                _i=int(np.argmin(np.abs(_bct-_a))); _wh[_i]+=_w
+            _pk=int(np.argmax(_wh)); _pc=_bct[_pk]
+            _cm=np.abs(_arr-_pc)<=4.; _cons=_warr[_cm].sum()/(_tw_total+1e-6)
+            if _cons>=0.50:
+                _ys=float(np.ptp(_mpy[_cm]))
+                if _ys>=0.20:
+                    tilt=float(np.average(_arr[_cm],weights=_warr[_cm]))
+    ts=clamp(100-abs(tilt)*8)
+    score=clamp(rot*0.28+bal*0.18+neg*0.15+conv*0.18+focal*0.12+ts*0.09)
+    return score,{"rule_of_thirds":round(rot,2),"balance":round(bal,2),"negative_space":round(neg,2),
+        "convergence":round(conv,2),"focal_strength":round(focal,2),"tilt_deg":round(tilt,3),
+        "tilt_score":round(ts,1),"saliency_cx":ctx["saliency_cx"],"saliency_cy":ctx["saliency_cy"]}
 
+# ── creative analysis ──────────────────────────────────────────────────────
 
-# ── Suggestions ───────────────────────────────────────────────────────────────
+def analyze_creative(ctx, color_m, cine_m, comp_m):
+    elements=[]; concerns=[]
+    ld=ctx["light_direction"]; bokeh=ctx["bokeh_detected"]; lum=ctx["luminosity_type"]; scene=ctx["scene_type"]
+    harmony=ctx["harmony"]; sat=ctx["sat_mean"]
+    if ld in ("top-left","top-right","left","right"):
+        elements.append({"signal":"directional_light","label":f"Directional light ({ld})","note":"Creates depth, dimension and mood."})
+    elif ld=="frontal" and scene=="subject":
+        concerns.append({"signal":"flat_lighting","label":"Flat/frontal lighting","note":"Reduces subject dimensionality. Move key light 30-45 off-axis."})
+    if bokeh and scene=="subject":
+        strength="strong" if ctx["bokeh_ratio"]>3.0 else "moderate"
+        elements.append({"signal":"bokeh","label":f"Subject isolation — {strength} bokeh","note":"Separates subject from background cinematically."})
+    if lum=="LOW-KEY" and scene=="subject":
+        elements.append({"signal":"low_key_portrait","label":"Low-key cinematic exposure","note":"Intentionally dark — moody and dramatic."})
+    if harmony in ("complementary","split-complementary") and sat>0.2:
+        elements.append({"signal":"color_harmony","label":f"{harmony.title()} color palette","note":"Visually dynamic color relationships."})
+    elif harmony=="analogous" and sat>0.18:
+        elements.append({"signal":"color_harmony","label":"Analogous color palette","note":"Harmonious, cohesive color feel."})
+    if color_m.get("creative_grade")=="possible":
+        elements.append({"signal":"creative_grade","label":"Intentional color grade detected","note":"Cast appears stylistic, not a WB error."})
+    diag=ctx["diag_lines"]; horiz=ctx["horiz_lines"]
+    if diag>15:
+        elements.append({"signal":"leading_lines","label":"Strong leading lines","note":"Diagonal lines create depth and guide the eye."})
+    elif horiz>60:
+        elements.append({"signal":"perspective_lines","label":"Perspective convergence","note":"Lines converging toward vanishing point — cinematic depth."})
+    focal=float(cine_m.get("focal_strength",50))
+    if focal>70:
+        elements.append({"signal":"strong_focal_point","label":"Strong visual focal point","note":"Viewer attention is well concentrated."})
+    elif focal<35:
+        concerns.append({"signal":"weak_focal_point","label":"Weak focal point","note":"Attention is scattered. Add a clear subject or point of interest."})
+    rot=float(comp_m.get("rule_of_thirds",50))
+    if rot>70 and scene=="subject":
+        elements.append({"signal":"rule_of_thirds","label":"Strong rule-of-thirds placement","note":"Subject on a compositional intersection."})
+    e_score=min(len(elements)*12,40); c_pen=min(len(concerns)*8,25)
+    cine_boost=5 if lum=="LOW-KEY" and bokeh else 0
+    creative_score=clamp(50.+e_score-c_pen+cine_boost)
+    return {"creative_score":creative_score,"elements_detected":elements,"concerns":concerns,
+        "summary":{"positive_signals":len(elements),"concerns":len(concerns),"bokeh_detected":bokeh,
+                   "light_direction":ld,"color_harmony":harmony,"luminosity_type":lum}}
 
-def build_suggestions(exposure_m, color_m, cine_m, comp_m, sharpness_m, scene_info):
-    s=[]; scene_type=scene_info.get("scene_type","subject")
+# ── suggestions ────────────────────────────────────────────────────────────
 
-    state=exposure_m.get("state","ok")
-    hl_hard=float(exposure_m.get("highlight_clip",0)); hl_soft=float(exposure_m.get("highlight_soft",0))
-    sh_hard=float(exposure_m.get("shadow_clip",0));   sh_soft=float(exposure_m.get("shadow_soft",0))
+def build_suggestions(exp_m, color_m, cine_m, comp_m, sharp_m, ctx, creative):
+    s=[]; scene=ctx["scene_type"]; lum=ctx["luminosity_type"]
+    state=exp_m.get("state","ok")
+    hl_hard=float(exp_m.get("highlight_clip",0)); hl_soft=float(exp_m.get("highlight_soft",0))
+    sh_hard=float(exp_m.get("shadow_clip",0));   sh_soft=float(exp_m.get("shadow_soft",0))
     if state=="overexposed":
-        if hl_hard>0.02: msg="Highlights are heavily clipped. Lower exposure ~1–1.5 stops or reduce key light to recover texture in whites."
-        elif hl_soft>0.05: msg="Image looks washed out / over-bright. Lower exposure ~0.5–1 stop to restore depth and contrast in the highlights."
-        else: msg="Image is slightly overexposed. Reduce exposure ~0.5 stop or protect highlights with a gentle S-curve in grading."
+        if hl_hard>0.02: msg="Highlights are heavily clipped. Lower exposure ~1-1.5 stops to recover texture."
+        elif hl_soft>0.05: msg="Image looks washed out. Lower exposure ~0.5-1 stop to restore depth in highlights."
+        else: msg="Slightly overexposed. Reduce exposure ~0.5 stop or pull highlights in grading."
         s.append({"category":"Exposure","priority":"high","message":msg})
     elif state=="underexposed":
-        if sh_hard>0.02: msg="Blacks are severely crushed. Lift exposure ~1–1.5 stops or add fill light to recover shadow detail."
-        elif sh_soft>0.05: msg="Image is underexposed with heavy shadows. Increase exposure ~0.5–1 stop or add soft fill to lift midtones."
-        else: msg="Image looks slightly underexposed. Increase exposure ~0.5 stop or raise midtones gently in post."
-        s.append({"category":"Exposure","priority":"high","message":msg})
-
-    eff=float(color_m.get("effective_cast",0)); temp=color_m.get("temperature","neutral"); tint=color_m.get("tint","neutral")
+        is_lk=any(e["signal"]=="low_key_portrait" for e in creative["elements_detected"])
+        if not is_lk:
+            if sh_hard>0.02: msg="Blacks are severely crushed. Lift exposure ~1-1.5 stops or add fill light."
+            elif sh_soft>0.05: msg="Image is underexposed. Lift ~0.5-1 stop or raise shadows in grading."
+            else: msg="Slightly underexposed. Lift exposure ~0.5 stop or raise midtones in post."
+            s.append({"category":"Exposure","priority":"high","message":msg})
+    eff=float(color_m.get("effective_cast",0)); temp=color_m.get("temperature","neutral")
+    tint=color_m.get("tint","neutral"); cg=color_m.get("creative_grade","unlikely")
     if eff>=8.0:
-        parts=[]
-        if temp=="cool/cyan": parts.append("cyan/teal")
-        elif temp=="cool":    parts.append("cool/blue")
-        elif temp=="warm":    parts.append("warm/yellow-orange")
-        if tint=="green":     parts.append("green")
-        elif tint=="magenta": parts.append("magenta")
-        label=" + ".join(parts) if parts else "color"
-        s.append({"category":"Color","priority":"high" if eff>=12 else "medium","message":f"Noticeable {label} cast detected. Correct white balance (Temp/Tint sliders) before applying any creative look."})
-
-    ls=float(sharpness_m.get("laplacian_std",50)); sh_state=sharpness_m.get("state","sharp")
-    if sh_state in ("very_soft","soft"):
-        msg="Image appears very soft or hazy. Check for lens fog, diffusion filter, or significant motion blur. Re-shoot if critical." if ls<8 else "Image looks slightly soft. Ensure subject is in focus and try a faster shutter speed to reduce motion blur."
+        if cg=="possible":
+            s.append({"category":"Color","priority":"low","message":f"A {temp} cast is present — if this is your intended grade, ignore this. Otherwise correct WB before applying any look."})
+        else:
+            parts=[]
+            if temp=="cool/cyan": parts.append("cyan/teal")
+            elif temp=="cool":    parts.append("cool/blue")
+            elif temp=="warm":    parts.append("warm/yellow-orange")
+            if tint=="green":     parts.append("green")
+            elif tint=="magenta": parts.append("magenta")
+            label=" + ".join(parts) if parts else "color"
+            s.append({"category":"Color","priority":"high" if eff>=12 else "medium","message":f"Noticeable {label} cast detected. Correct white balance before grading."})
+    sh_state=sharp_m.get("state","sharp"); ls=float(sharp_m.get("laplacian_std",50))
+    bokeh=sharp_m.get("bokeh_detected",False); src=sharp_m.get("source","global")
+    if sh_state in ("very_soft","soft") and not bokeh:
+        msg=("Image appears very soft or hazy. Check focus, lens cleanliness, or motion blur." if ls<8 else
+             "Image looks slightly soft. Ensure subject is in focus and try a faster shutter speed.")
         s.append({"category":"Sharpness","priority":"medium","message":msg})
-
-    if scene_type=="subject":
+    elif sh_state in ("very_soft","soft") and bokeh and src=="face_roi":
+        s.append({"category":"Sharpness","priority":"medium","message":"Subject face appears soft even with bokeh. Check focus accuracy on the eyes."})
+    if ctx["light_direction"]=="frontal" and scene=="subject":
+        s.append({"category":"Lighting","priority":"low","message":"Lighting appears flat/frontal. Moving the key light 30-45 off-axis adds depth and dimension."})
+    if scene=="subject":
         sep=float(cine_m.get("subject_separation",50))
-        if sep<35: s.append({"category":"Cinematography","priority":"medium","message":"Subject separation is low. Increase subject–background distance, simplify the background, or use a longer focal length to compress and isolate the subject."})
+        if sep<35 and ctx["bokeh_ratio"]<1.8:
+            s.append({"category":"Cinematography","priority":"medium","message":"Subject separation is low. Increase subject-background distance or use a longer focal length."})
     else:
-        layer=float(cine_m.get("layer_complexity",50))
-        if layer<35: s.append({"category":"Cinematography","priority":"low","message":"The scene looks visually flat. Try adding foreground elements, leading lines, or varying depth to create more visual interest."})
-
-    td=float(comp_m.get("tilt_deg",0))
-    if abs(td)>=2.5: s.append({"category":"Composition","priority":"medium","message":f"Horizon/lines appear tilted (~{abs(td):.1f}°). Level the shot in-camera or correct rotation in post for a cleaner, more professional look."})
+        if float(cine_m.get("layer_complexity",50))<35:
+            s.append({"category":"Cinematography","priority":"low","message":"Scene looks flat. Add foreground elements or find leading lines to create depth."})
+    tilt=float(comp_m.get("tilt_deg",0))
+    if abs(tilt)>=2.5:
+        s.append({"category":"Composition","priority":"medium","message":f"Lines tilted ~{abs(tilt):.1f}. Level the shot or correct rotation in post."})
     return s
 
-
-# ── Main Endpoint ─────────────────────────────────────────────────────────────
+# ── endpoint ───────────────────────────────────────────────────────────────
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    contents=await file.read()
-    image=cv2.imdecode(np.frombuffer(contents,np.uint8), cv2.IMREAD_COLOR)
+    contents = await file.read()
+    image    = cv2.imdecode(np.frombuffer(contents,np.uint8), cv2.IMREAD_COLOR)
     if image is None: return {"ok":False,"error":"Invalid image"}
-
-    scene_info=detect_scene_type(image); scene_type=scene_info["scene_type"]
-
-    exposure_score,  exposure_metrics  = analyze_exposure(image)
-    contrast_score,  contrast_metrics  = analyze_contrast(image)
-    color_score,     color_metrics     = analyze_color_balance(image)
-    noise_score,     noise_metrics     = analyze_noise(image)
-    sharpness_score, sharpness_metrics = analyze_sharpness(image)
-    cine_score,      cine_metrics      = analyze_cinematography(image, scene_type)
-    comp_score,      comp_metrics      = analyze_composition(image)
-
-    skin_score=skin_metrics=None
+    ctx        = build_scene_context(image)
+    scene_type = ctx["scene_type"]
+    exp_s,exp_m   = analyze_exposure(image,ctx)
+    con_s,con_m   = analyze_contrast(image,ctx)
+    col_s,col_m   = analyze_color_balance(image,ctx)
+    noi_s,noi_m   = analyze_noise(image,ctx)
+    sha_s,sha_m   = analyze_sharpness(image,ctx)
+    cin_s,cin_m   = analyze_cinematography(image,ctx)
+    comp_s,comp_m = analyze_composition(image,ctx)
+    skin_s=skin_m=None
+    if scene_type=="subject": skin_s,skin_m=analyze_skin(image,ctx)
+    creative = analyze_creative(ctx,col_m,cin_m,comp_m)
+    cre_s    = creative["creative_score"]
+    suggestions = build_suggestions(exp_m,col_m,cin_m,comp_m,sha_m,ctx,creative)
     if scene_type=="subject":
-        skin_score,skin_metrics=analyze_skin(image)
-
-    suggestions=build_suggestions(exposure_metrics,color_metrics,cine_metrics,comp_metrics,sharpness_metrics,scene_info)
-
-    if scene_type=="subject":
-        cinematic_score=int(exposure_score*0.22+contrast_score*0.12+color_score*0.16+(skin_score or 50)*0.10+noise_score*0.06+sharpness_score*0.08+cine_score*0.14+comp_score*0.12)
+        tech = exp_s*0.22+con_s*0.10+col_s*0.14+(skin_s or 50)*0.08+noi_s*0.05+sha_s*0.08+cin_s*0.13+comp_s*0.10
     else:
-        cinematic_score=int(exposure_score*0.22+contrast_score*0.16+color_score*0.20+noise_score*0.06+sharpness_score*0.08+cine_score*0.16+comp_score*0.12)
-
-    breakdown={"exposure":round(exposure_score,1),"contrast":round(contrast_score,1),"color":round(color_score,1)}
-    if scene_type=="subject" and skin_score is not None: breakdown["skin"]=round(skin_score,1)
-    breakdown.update({"noise":round(noise_score,1),"sharpness":round(sharpness_score,1),"cinematography":round(cine_score,1),"composition":round(comp_score,1)})
-
-    metrics={"scene":scene_info,"exposure":exposure_metrics,"contrast":contrast_metrics,"color":color_metrics,"noise":noise_metrics,"sharpness":sharpness_metrics,"cinematography":cine_metrics,"composition":comp_metrics}
-    if scene_type=="subject" and skin_metrics: metrics["skin"]=skin_metrics
-
-    return {"ok":True,"score":cinematic_score,"scene_type":scene_type,"breakdown":breakdown,"metrics":metrics,"suggestions":suggestions}
+        tech = exp_s*0.22+con_s*0.14+col_s*0.18+noi_s*0.06+sha_s*0.08+cin_s*0.16+comp_s*0.11
+    cinematic_score = int(tech*0.85+cre_s*0.15)
+    breakdown={"exposure":round(exp_s,1),"contrast":round(con_s,1),"color":round(col_s,1)}
+    if scene_type=="subject" and skin_s is not None: breakdown["skin"]=round(skin_s,1)
+    breakdown.update({"noise":round(noi_s,1),"sharpness":round(sha_s,1),
+                      "cinematography":round(cin_s,1),"composition":round(comp_s,1),"creative":round(cre_s,1)})
+    ctx_out = {k:v for k,v in ctx.items() if k!="_img"}
+    return {"ok":True,"score":cinematic_score,"scene_type":scene_type,"breakdown":breakdown,
+        "metrics":{"scene":ctx_out,"exposure":exp_m,"contrast":con_m,"color":col_m,
+                   "noise":noi_m,"sharpness":sha_m,"cinematography":cin_m,"composition":comp_m,
+                   **( {"skin":skin_m} if skin_m else {})},
+        "creative":creative,"suggestions":suggestions}
