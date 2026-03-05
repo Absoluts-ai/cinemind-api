@@ -110,6 +110,7 @@ def merge_vision_into_creative(creative: dict, vision: dict, scene_type: str) ->
     Vision API is primary source for creative score and elements.
     Context boosts applied for intentional cinematic choices Vision may undervalue.
     Weighting: subject 50/50, ambient 70/30.
+    Severe penalty applied when multiple confirmed technical problems exist.
     """
     if not vision:
         return creative
@@ -117,14 +118,20 @@ def merge_vision_into_creative(creative: dict, vision: dict, scene_type: str) ->
     vision_score = float(vision.get("creative_score", 50))
     opencv_score = float(creative.get("creative_score", 50))
 
-    # Context-aware boost for intentional choices Vision may still penalise
+    # How many confirmed technical problems exist?
+    known_issues = creative.get("_known_issues_count", 0)
+
+    # Context-aware boost for intentional cinematic choices
     opencv_elements = creative.get("elements_detected", [])
     opencv_signals  = {e.get("signal","") for e in opencv_elements}
     boost = 0.0
-    if "low_key_portrait" in opencv_signals:   boost += 6.0
-    if any("bokeh" in s for s in opencv_signals): boost += 5.0
+    if "low_key_portrait" in opencv_signals:      boost += 6.0
+    if any("bokeh" in s for s in opencv_signals):  boost += 5.0
     if any("leading" in s for s in opencv_signals): boost += 3.0
     boost = min(boost, 12.0)
+    # No boost if scene is technically compromised
+    if known_issues >= 2:
+        boost = 0.0
     vision_score_adj = min(100.0, vision_score + boost)
 
     if scene_type == "subject":
@@ -132,37 +139,49 @@ def merge_vision_into_creative(creative: dict, vision: dict, scene_type: str) ->
     else:
         final_creative = vision_score_adj * 0.50 + opencv_score * 0.50
 
+    # Cap elements based on severity of technical problems
+    # 0-1 issues: up to 4 elements
+    # 2 issues:   up to 1 element (and only if genuinely unrelated to the problems)
+    # 3+ issues:  no elements — scene is too compromised to highlight positives
+    if known_issues >= 3:
+        max_elements = 0
+    elif known_issues == 2:
+        max_elements = 1
+    else:
+        max_elements = 4
+
     vision_strengths = vision.get("strengths", [])
     vision_concerns  = vision.get("concerns", [])
 
     elements = [{"signal": f"vision_{i}", "label": s["label"], "note": s["note"]}
-                for i, s in enumerate(vision_strengths[:3])]
+                for i, s in enumerate(vision_strengths[:max_elements])]
     concerns  = [{"signal": f"vision_c_{i}", "label": c["label"], "note": c["note"]}
                 for i, c in enumerate(vision_concerns[:2])]
 
-    vision_labels_low = {e["label"].lower() for e in elements}
-    for e in opencv_elements:
-        if not any(kw in e["label"].lower() for kw in ["bokeh","leading lines","rule","low-key","directional"]):
-            continue
-        if not any(kw in vision_labels_low for kw in e["label"].lower().split()):
-            elements.append(e)
-        if len(elements) >= 4:
-            break
+    # Add OpenCV signals only if we still have room and scene isn't too compromised
+    if known_issues < 2:
+        vision_labels_low = {e["label"].lower() for e in elements}
+        for e in opencv_elements:
+            if not any(kw in e["label"].lower() for kw in ["bokeh","leading lines","rule","low-key","directional"]):
+                continue
+            if not any(kw in vision_labels_low for kw in e["label"].lower().split()):
+                elements.append(e)
+            if len(elements) >= max_elements:
+                break
 
     result = dict(creative)
-    result["elements_detected"] = elements[:4]
+    result["elements_detected"] = elements[:max_elements]
     result["concerns"]          = concerns[:2]
     result["creative_score"]    = float(max(0, min(100, final_creative)))
     result["vision"] = {
-        "creative_score":    vision_score,
+        "creative_score":     vision_score,
         "creative_score_adj": round(vision_score_adj, 1),
-        "overall_read":      vision.get("overall_read", ""),
-        "grade_intent":      vision.get("grade_intent", ""),
-        "lighting_read":     vision.get("lighting_read", ""),
-        "color_cast_detail": vision.get("color_cast_detail", ""),
+        "overall_read":       vision.get("overall_read", ""),
+        "grade_intent":       vision.get("grade_intent", ""),
+        "lighting_read":      vision.get("lighting_read", ""),
+        "color_cast_detail":  vision.get("color_cast_detail", ""),
     }
     return result
-
 
 @app.get("/")
 def root(): return {"service": "cinemind-api-v6"}
@@ -688,6 +707,8 @@ async def analyze(file: UploadFile = File(...)):
     opencv_data = {**{k:v for k,v in ctx.items() if k!="_img"}, "tonal": ctx["tonal"],
                    "_known_issues": _known_issues, "_intentional": _intentional}
     vision   = await analyze_vision(image, opencv_data)
+    # Pass issue count into creative so merge can apply caps
+    creative["_known_issues_count"] = len(_known_issues)
     creative = merge_vision_into_creative(creative, vision, scene_type)
     cre_s = creative["creative_score"]
     suggestions = build_suggestions(exp_m,col_m,cin_m,comp_m,sha_m,ctx,creative)
@@ -697,6 +718,29 @@ async def analyze(file: UploadFile = File(...)):
     else:
         tech_score = exp_s*0.22+con_s*0.14+col_s*0.18+noi_s*0.06+sha_s*0.08+cin_s*0.16+comp_s*0.11
         cinematic_score = int(tech_score*0.70 + cre_s*0.30)
+    # Hard ceiling based on confirmed technical problems
+    # Scenes with serious issues cannot score as high as clean shots
+    n_issues = len(_known_issues)
+    _issues_set = set(_known_issues)
+    # Extra penalty if both primary perceptual problems are present together
+    _has_exp   = any("exposure" in i for i in _issues_set)
+    _has_color = any("color" in i for i in _issues_set)
+    _has_sharp = any("sharpness" in i for i in _issues_set)
+    _double_primary = _has_exp and _has_color  # worst combo: wrong exposure + wrong color
+    _triple = _has_exp and _has_color and _has_sharp  # all three primary issues
+    if _triple:
+        cinematic_score = min(cinematic_score, 38)
+    elif _double_primary:
+        cinematic_score = min(cinematic_score, 45)
+    elif n_issues >= 3:
+        cinematic_score = min(cinematic_score, 45)
+    elif n_issues == 2:
+        cinematic_score = min(cinematic_score, 60)
+    elif n_issues == 1 and scene_type == "ambient":
+        cinematic_score = min(cinematic_score, 70)
+    # Small boost for strong subject scenes with no issues at all
+    elif n_issues == 0 and scene_type == "subject" and cre_s >= 70:
+        cinematic_score = min(100, cinematic_score + 4)
     breakdown={"exposure":round(exp_s,1),"contrast":round(con_s,1),"color":round(col_s,1)}
     if scene_type=="subject" and skin_s is not None: breakdown["skin"]=round(skin_s,1)
     breakdown.update({"noise":round(noi_s,1),"sharpness":round(sha_s,1),
