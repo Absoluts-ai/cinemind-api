@@ -10,10 +10,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 def build_vision_prompt(opencv_data: dict) -> str:
-    """
-    Builds a context-rich prompt that gives Claude the OpenCV measurements
-    so it can reason like a DOP who already has the technical data.
-    """
     scene   = opencv_data.get("scene_type", "unknown")
     lum     = opencv_data.get("luminosity_type", "unknown")
     bokeh   = opencv_data.get("bokeh_ratio", 0)
@@ -25,44 +21,51 @@ def build_vision_prompt(opencv_data: dict) -> str:
     t       = opencv_data.get("tonal", {})
     p50     = t.get(50, 0)
     dr      = t.get("dynamic_range", 0)
+    tech_problems = opencv_data.get("_known_issues", [])
+    issues_str = ", ".join(tech_problems) if tech_problems else "none"
+    return (
+        "You are a professional video and photography consultant with deep knowledge of "
+        "cinematography, color, composition, and visual storytelling across commercial "
+        "production, branded content, streaming series, music videos, documentary, and "
+        "social media video.\n\n"
+        "You are analyzing a Rec.709 preview frame from Apple Log footage shot on an "
+        "iPhone or consumer camera.\n\n"
+        "YOUR REFERENCE STANDARD: published professional content — TV commercials, "
+        "branded social media campaigns, streaming series, editorial photography, music "
+        "videos. Not Hollywood blockbusters, but the polished professional work you see "
+        "from competent production companies every day.\n\n"
+        "SCORING SCALE:\n"
+        "- 30-50: Unintentional, no visual awareness, significant technical errors\n"
+        "- 51-65: Some awareness and effort, but execution has notable problems or lacks clear intent\n"
+        "- 66-75: Solid work — clear subject, decent exposure, intentional choices, publishable with minor fixes\n"
+        "- 76-85: Strong professional-looking result — good light, clear story, well composed\n"
+        "- 86-95: Excellent — stands out even among professional content\n"
+        "- 96-100: Exceptional, outstanding even by broadcast/streaming standards\n\n"
+        f"Technical measurements already confirmed:\n"
+        f"- Scene: {scene} | Luminosity: {lum} | Faces: {faces}\n"
+        f"- Exposure p50={p50:.0f} | Dynamic range={dr:.0f}\n"
+        f"- Bokeh ratio={bokeh:.2f} (>1.8=isolation, >3.0=strong)\n"
+        f"- Light direction: {light}\n"
+        f"- Color saturation={sat:.2f} | harmony={harmony}\n"
+        f"- Saliency spread={spread:.2f} (lower=more focused)\n"
+        f"- Technical problems already confirmed: {issues_str}\n\n"
+        "STRICT RULES:\n"
+        "- If a technical problem is confirmed above, do NOT list that area as a strength\n"
+        "- Do NOT invent strengths — only list what is genuinely and clearly working\n"
+        "- Do NOT contradict yourself between strengths and concerns\n"
+        "- Concerns must be clearly visible and impactful — do not nitpick\n\n"
+        "Respond ONLY with valid JSON, no markdown, no extra text:\n"
+        "{\n"
+        '  \"creative_score\": <integer 0-100>,\n'
+        '  \"overall_read\": \"<one honest sentence: what is this shot and does it work?>\",\n'
+        '  \"strengths\": [{{\"label\": \"<max 5 words>\", \"note\": \"<one sentence>\"}}],\n'
+        '  \"concerns\": [{{\"label\": \"<max 5 words>\", \"note\": \"<one sentence>\"}}],\n'
+        '  \"grade_intent\": \"<neutral|warm|cool|desaturated|stylized>\",\n'
+        '  \"color_cast_detail\": \"<precise description of visible cast e.g. magenta in midtones, or empty>\",\n'
+        '  \"lighting_read\": \"<one sentence on lighting quality and intent>\"\n'
+        "}"
+    )
 
-    return f"""You are one of the world's leading directors of photography, with deep knowledge of cinema history spanning from the golden age of Hollywood to contemporary filmmaking. You have internalized the visual language of masters like Roger Deakins, Emmanuel Lubezki, Gordon Willis, Vilmos Zsigmond, Vittorio Storaro — and equally the aesthetic vocabularies of editorial photography, music videos, and documentary filmmaking.
-
-You are analyzing a Rec.709 preview frame from Apple Log footage.
-
-The technical analysis system has already measured the following objective data:
-- Scene type: {scene} | Luminosity: {lum} | Faces detected: {faces}
-- Exposure: p50={p50:.0f} | Dynamic range: {dr:.0f}
-- Bokeh ratio: {bokeh:.2f} (>1.8 = bokeh present, >3.0 = strong isolation)
-- Light direction: {light}
-- Color: saturation={sat:.2f} | harmony={harmony}
-- Saliency spread: {spread:.2f} (lower = more concentrated attention)
-
-Now look at the image itself and evaluate it as a cinematographer would — drawing on your knowledge of thousands of films, not just these numbers.
-
-Be ruthlessly honest. A technically mediocre frame with no creative vision should score low. A beautifully crafted cinematic image with clear intent should score high even if technically imperfect.
-
-Respond ONLY with a valid JSON object — no markdown, no preamble, no extra text:
-{{
-  "creative_score": <integer 0-100, your honest cinematographic assessment>,
-  "overall_read": "<one punchy sentence: what is this shot?  what does it achieve or fail at?>",
-  "strengths": [
-    {{"label": "<short title>", "note": "<one sentence why this works cinematographically>"}},
-    ... max 3 items, only include genuine strengths
-  ],
-  "concerns": [
-    {{"label": "<short title>", "note": "<one sentence why this is a problem>"}},
-    ... max 2 items, only include real problems visible in the frame
-  ],
-  "grade_intent": "<neutral|warm|cool|desaturated|stylized>",
-  "lighting_read": "<one sentence describing the lighting quality and motivation>"
-}}
-
-Rules:
-- creative_score must reflect the full cinematic tradition — 50 is average, 70 is good, 85+ is genuinely excellent work
-- Do NOT list a strength and then contradict it with a concern
-- Do NOT invent problems that aren't visible
-- Do NOT be generous — compare to the best work in cinema, not to amateur footage"""
 
 async def analyze_vision(image_bgr, opencv_data: dict) -> dict:
     if not ANTHROPIC_API_KEY:
@@ -149,10 +152,11 @@ def merge_vision_into_creative(creative: dict, vision: dict, scene_type: str) ->
     result["concerns"]          = concerns[:2]
     result["creative_score"]    = float(max(0, min(100, final_creative)))
     result["vision"] = {
-        "creative_score":  vision_score,
-        "overall_read":    vision.get("overall_read", ""),
-        "grade_intent":    vision.get("grade_intent", ""),
-        "lighting_read":   vision.get("lighting_read", ""),
+        "creative_score":    vision_score,
+        "overall_read":      vision.get("overall_read", ""),
+        "grade_intent":      vision.get("grade_intent", ""),
+        "lighting_read":     vision.get("lighting_read", ""),
+        "color_cast_detail": vision.get("color_cast_detail", ""),
     }
     return result
 
@@ -564,6 +568,22 @@ def analyze_creative(ctx, color_m, cine_m, comp_m):
 
 # ── suggestions ────────────────────────────────────────────────────────────
 
+def _color_fix_hint(cast_desc: str) -> str:
+    """Returns a software-agnostic correction hint based on cast description."""
+    cd = cast_desc.lower()
+    if "magenta" in cd:
+        return "In your color tools, reduce the magenta channel or add green in the midtones."
+    elif "green" in cd:
+        return "In your color tools, reduce green or add a touch of magenta in the midtones."
+    elif "cyan" in cd or "teal" in cd:
+        return "Raise the color temperature slider or reduce the blue/cyan channel."
+    elif "cool" in cd or "blue" in cd:
+        return "Raise the color temperature (warmer) to neutralize the blue cast."
+    elif "warm" in cd or "orange" in cd or "yellow" in cd:
+        return "Lower the color temperature (cooler) or reduce the orange channel in midtones."
+    else:
+        return "Use the white balance or color mixer tool in your editor to neutralize the cast."
+
 def build_suggestions(exp_m, color_m, cine_m, comp_m, sharp_m, ctx, creative):
     s=[]; scene=ctx["scene_type"]; lum=ctx["luminosity_type"]
     state=exp_m.get("state","ok")
@@ -583,18 +603,25 @@ def build_suggestions(exp_m, color_m, cine_m, comp_m, sharp_m, ctx, creative):
             s.append({"category":"Exposure","priority":"high","message":msg})
     eff=float(color_m.get("effective_cast",0)); temp=color_m.get("temperature","neutral")
     tint=color_m.get("tint","neutral"); cg=color_m.get("creative_grade","unlikely")
+    vision_cast=(creative.get("vision") or {}).get("color_cast_detail","")
     if eff>=8.0:
         if cg=="possible":
-            s.append({"category":"Color","priority":"low","message":f"A {temp} cast is present — if this is your intended grade, ignore this. Otherwise correct WB before applying any look."})
+            cast_desc=vision_cast if vision_cast else temp
+            s.append({"category":"Color","priority":"low","message":f"A {cast_desc} cast is present — if this is your intended grade, ignore this. Otherwise correct white balance before applying any look."})
         else:
-            parts=[]
-            if temp=="cool/cyan": parts.append("cyan/teal")
-            elif temp=="cool":    parts.append("cool/blue")
-            elif temp=="warm":    parts.append("warm/yellow-orange")
-            if tint=="green":     parts.append("green")
-            elif tint=="magenta": parts.append("magenta")
-            label=" + ".join(parts) if parts else "color"
-            s.append({"category":"Color","priority":"high" if eff>=12 else "medium","message":f"Noticeable {label} cast detected. Correct white balance before grading."})
+            if vision_cast:
+                fix=_color_fix_hint(vision_cast)
+                s.append({"category":"Color","priority":"high" if eff>=12 else "medium","message":f"{vision_cast.capitalize()} detected. {fix}"})
+            else:
+                parts=[]
+                if temp=="cool/cyan": parts.append("cyan/teal")
+                elif temp=="cool":    parts.append("cool/blue")
+                elif temp=="warm":    parts.append("warm/yellow-orange")
+                if tint=="green":     parts.append("green tint")
+                elif tint=="magenta": parts.append("magenta tint")
+                label=" + ".join(parts) if parts else "color"
+                fix=_color_fix_hint(label)
+                s.append({"category":"Color","priority":"high" if eff>=12 else "medium","message":f"Noticeable {label} cast detected. {fix}"})
     sh_state=sharp_m.get("state","sharp"); ls=float(sharp_m.get("laplacian_std",50))
     bokeh=sharp_m.get("bokeh_detected",False); src=sharp_m.get("source","global")
     if sh_state in ("very_soft","soft") and not bokeh:
@@ -636,7 +663,12 @@ async def analyze(file: UploadFile = File(...)):
     skin_s=skin_m=None
     if scene_type=="subject": skin_s,skin_m=analyze_skin(image,ctx)
     creative = analyze_creative(ctx,col_m,cin_m,comp_m)
-    opencv_data = {**{k:v for k,v in ctx.items() if k!="_img"}, "tonal": ctx["tonal"]}
+    # Build known_issues list for Vision prompt (no contradictions)
+    _known_issues = []
+    if exp_m.get("state") in ("overexposed","underexposed"): _known_issues.append(f"exposure {exp_m['state']}")
+    if col_m.get("effective_cast",0) >= 8: _known_issues.append(f"color cast ({col_m.get('temperature','unknown')})")
+    if sha_m.get("state") in ("very_soft","soft"): _known_issues.append("sharpness soft")
+    opencv_data = {**{k:v for k,v in ctx.items() if k!="_img"}, "tonal": ctx["tonal"], "_known_issues": _known_issues}
     vision   = await analyze_vision(image, opencv_data)
     creative = merge_vision_into_creative(creative, vision, scene_type)
     cre_s = creative["creative_score"]
