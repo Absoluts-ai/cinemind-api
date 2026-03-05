@@ -699,8 +699,9 @@ async def analyze(file: UploadFile = File(...)):
         _intentional.append("low-key exposure is intentional — dark tones are a creative choice, not an error")
     elif lum_type == "HIGH-KEY" and exp_m.get("state") in ("ok","overexposed"):
         _intentional.append("high-key exposure is intentional — bright tones are a creative choice")
-    if col_m.get("effective_cast",0) >= 8: _known_issues.append(f"color cast ({col_m.get('temperature','unknown')})")
+    if col_m.get("effective_cast",0) >= 6: _known_issues.append(f"color cast ({col_m.get('temperature','unknown')})")
     if sha_m.get("state") in ("very_soft","soft"): _known_issues.append("sharpness soft")
+    elif sha_m.get("state") == "moderate" and scene_type == "ambient": _known_issues.append("sharpness moderate")
     # Pass bokeh as intentional if strong
     if ctx.get("bokeh_ratio",0) > 1.8:
         _intentional.append(f"background blur/bokeh is intentional subject isolation (ratio={ctx['bokeh_ratio']:.1f})")
@@ -750,4 +751,8 @@ async def analyze(file: UploadFile = File(...)):
         "metrics":{"scene":ctx_out,"exposure":exp_m,"contrast":con_m,"color":col_m,
                    "noise":noi_m,"sharpness":sha_m,"cinematography":cin_m,"composition":comp_m,
                    **( {"skin":skin_m} if skin_m else {})},
-        "creative":creative,"suggestions":suggestions}
+        "creative":creative,"suggestions":suggestions,
+        "_debug":{"known_issues":_known_issues,"n_issues":len(_known_issues),
+                  "effective_cast":round(col_m.get("effective_cast",0),2),
+                  "sha_state":sha_m.get("state"),"exp_state":exp_m.get("state"),
+                  "lum_type":lum_type}}
