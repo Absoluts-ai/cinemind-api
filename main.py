@@ -9,13 +9,62 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-VISION_PROMPT = """You are an expert cinematographer and colorist analyzing a Rec.709 preview frame from Apple Log footage.
-Analyze this image and respond ONLY with a valid JSON object — no markdown, no preamble, no extra text.
-Return exactly this structure:
-{"light_quality":"hard|soft|mixed","light_motivation":"motivated|unmotivated|unknown","light_description":"one sentence describing the lighting","creative_intent":"one sentence on the apparent creative intent","grade_intent":"neutral|warm|cool|desaturated|stylized","technical_issues":["list of real technical problems, empty if none"],"creative_strengths":["list of genuine creative strengths, empty if none"],"creative_concerns":["list of genuine creative weaknesses, empty if none"],"overall_read":"one sentence summary of the shot quality"}
-Be precise and honest. Only mention what is clearly visible. Max 2 items per list."""
+def build_vision_prompt(opencv_data: dict) -> str:
+    """
+    Builds a context-rich prompt that gives Claude the OpenCV measurements
+    so it can reason like a DOP who already has the technical data.
+    """
+    scene   = opencv_data.get("scene_type", "unknown")
+    lum     = opencv_data.get("luminosity_type", "unknown")
+    bokeh   = opencv_data.get("bokeh_ratio", 0)
+    light   = opencv_data.get("light_direction", "unknown")
+    harmony = opencv_data.get("harmony", "unknown")
+    sat     = opencv_data.get("sat_mean", 0)
+    spread  = opencv_data.get("saliency_spread", 0.5)
+    faces   = len(opencv_data.get("faces", []))
+    t       = opencv_data.get("tonal", {})
+    p50     = t.get(50, 0)
+    dr      = t.get("dynamic_range", 0)
 
-async def analyze_vision(image_bgr) -> dict:
+    return f"""You are one of the world's leading directors of photography, with deep knowledge of cinema history spanning from the golden age of Hollywood to contemporary filmmaking. You have internalized the visual language of masters like Roger Deakins, Emmanuel Lubezki, Gordon Willis, Vilmos Zsigmond, Vittorio Storaro — and equally the aesthetic vocabularies of editorial photography, music videos, and documentary filmmaking.
+
+You are analyzing a Rec.709 preview frame from Apple Log footage.
+
+The technical analysis system has already measured the following objective data:
+- Scene type: {scene} | Luminosity: {lum} | Faces detected: {faces}
+- Exposure: p50={p50:.0f} | Dynamic range: {dr:.0f}
+- Bokeh ratio: {bokeh:.2f} (>1.8 = bokeh present, >3.0 = strong isolation)
+- Light direction: {light}
+- Color: saturation={sat:.2f} | harmony={harmony}
+- Saliency spread: {spread:.2f} (lower = more concentrated attention)
+
+Now look at the image itself and evaluate it as a cinematographer would — drawing on your knowledge of thousands of films, not just these numbers.
+
+Be ruthlessly honest. A technically mediocre frame with no creative vision should score low. A beautifully crafted cinematic image with clear intent should score high even if technically imperfect.
+
+Respond ONLY with a valid JSON object — no markdown, no preamble, no extra text:
+{{
+  "creative_score": <integer 0-100, your honest cinematographic assessment>,
+  "overall_read": "<one punchy sentence: what is this shot?  what does it achieve or fail at?>",
+  "strengths": [
+    {{"label": "<short title>", "note": "<one sentence why this works cinematographically>"}},
+    ... max 3 items, only include genuine strengths
+  ],
+  "concerns": [
+    {{"label": "<short title>", "note": "<one sentence why this is a problem>"}},
+    ... max 2 items, only include real problems visible in the frame
+  ],
+  "grade_intent": "<neutral|warm|cool|desaturated|stylized>",
+  "lighting_read": "<one sentence describing the lighting quality and motivation>"
+}}
+
+Rules:
+- creative_score must reflect the full cinematic tradition — 50 is average, 70 is good, 85+ is genuinely excellent work
+- Do NOT list a strength and then contradict it with a concern
+- Do NOT invent problems that aren't visible
+- Do NOT be generous — compare to the best work in cinema, not to amateur footage"""
+
+async def analyze_vision(image_bgr, opencv_data: dict) -> dict:
     if not ANTHROPIC_API_KEY:
         return {}
     try:
@@ -26,12 +75,13 @@ async def analyze_vision(image_bgr) -> dict:
             img = cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
         _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
         b64 = base64.b64encode(buf.tobytes()).decode()
+        prompt = build_vision_prompt(opencv_data)
         payload = {
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 500,
+            "max_tokens": 700,
             "messages": [{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-                {"type": "text", "text": VISION_PROMPT}
+                {"type": "text", "text": prompt}
             ]}]
         }
         async with httpx.AsyncClient(timeout=25.0) as client:
@@ -49,40 +99,61 @@ async def analyze_vision(image_bgr) -> dict:
     except Exception:
         return {}
 
-def merge_vision_into_creative(creative: dict, vision: dict) -> dict:
+def merge_vision_into_creative(creative: dict, vision: dict, scene_type: str) -> dict:
+    """
+    Vision API is now the primary source for creative score and elements.
+    OpenCV signals are kept only if Vision doesn't cover them.
+    Score weighting: subject 50/50, ambient 70/30.
+    """
     if not vision:
         return creative
-    elements = list(creative.get("elements_detected", []))
-    concerns  = list(creative.get("concerns", []))
-    lq = vision.get("light_quality", "")
-    lm = vision.get("light_motivation", "")
-    ld = vision.get("light_description", "")
-    gi = vision.get("grade_intent", "")
-    ci = vision.get("creative_intent", "")
-    if lq == "soft" and lm == "motivated":
-        elements.append({"signal":"vision_light","label":"Soft, motivated lighting","note": ld or "Light feels natural and purposeful."})
-    elif lq == "hard" and lm == "motivated":
-        elements.append({"signal":"vision_light","label":"Hard, motivated lighting","note": ld or "Directional light creates strong shadows and drama."})
-    elif lm == "unmotivated":
-        if not any(c["signal"]=="flat_lighting" for c in concerns):
-            concerns.append({"signal":"vision_light","label":"Unmotivated lighting","note": ld or "Light source unclear from scene context."})
-    for s in vision.get("creative_strengths", [])[:2]:
-        if s and len(s) > 5:
-            elements.append({"signal":"vision_strength","label": s,"note": vision.get("overall_read","")})
-    for c in vision.get("creative_concerns", [])[:2]:
-        if c and len(c) > 5:
-            concerns.append({"signal":"vision_concern","label": c,"note":""})
-    if gi in ("warm","cool","desaturated","stylized") and ci:
-        elements.append({"signal":"vision_intent","label":f"Creative intent: {gi} grade","note": ci})
-    base = float(creative.get("creative_score", 50))
-    bonus = min(len(elements)*3, 12) - min(len(concerns)*2, 8)
+
+    # Vision creative score
+    vision_score = float(vision.get("creative_score", 50))
+
+    # OpenCV creative score
+    opencv_score = float(creative.get("creative_score", 50))
+
+    # Weighted final creative score
+    if scene_type == "subject":
+        final_creative = vision_score * 0.70 + opencv_score * 0.30
+    else:
+        final_creative = vision_score * 0.50 + opencv_score * 0.50
+
+    # Build elements: Vision strengths take priority, then unique OpenCV signals
+    vision_strengths = vision.get("strengths", [])
+    vision_concerns  = vision.get("concerns", [])
+
+    # Convert vision format to our format
+    elements = [{"signal": f"vision_{i}", "label": s["label"], "note": s["note"]}
+                for i, s in enumerate(vision_strengths[:3])]
+    concerns  = [{"signal": f"vision_c_{i}", "label": c["label"], "note": c["note"]}
+                for i, c in enumerate(vision_concerns[:2])]
+
+    # Add OpenCV signals that Vision likely didn't cover (unique technical observations)
+    opencv_elements = creative.get("elements_detected", [])
+    opencv_concerns  = creative.get("concerns", [])
+    vision_labels_low = {e["label"].lower() for e in elements}
+
+    for e in opencv_elements:
+        # Only add if it's genuinely different from what Vision said
+        if not any(kw in e["label"].lower() for kw in ["bokeh","leading lines","rule","low-key","directional"]):
+            continue
+        if not any(kw in vision_labels_low for kw in e["label"].lower().split()):
+            elements.append(e)
+        if len(elements) >= 4:
+            break
+
     result = dict(creative)
-    result["elements_detected"] = elements
-    result["concerns"]          = concerns
-    result["creative_score"]    = float(max(0, min(100, base + bonus)))
-    result["vision"] = {"light_quality":lq,"light_motivation":lm,"grade_intent":gi,
-                        "overall_read":vision.get("overall_read",""),
-                        "technical_issues":vision.get("technical_issues",[])}
+    result["elements_detected"] = elements[:4]
+    result["concerns"]          = concerns[:2]
+    result["creative_score"]    = float(max(0, min(100, final_creative)))
+    result["vision"] = {
+        "creative_score":  vision_score,
+        "overall_read":    vision.get("overall_read", ""),
+        "grade_intent":    vision.get("grade_intent", ""),
+        "lighting_read":   vision.get("lighting_read", ""),
+    }
     return result
 
 @app.get("/")
@@ -565,15 +636,17 @@ async def analyze(file: UploadFile = File(...)):
     skin_s=skin_m=None
     if scene_type=="subject": skin_s,skin_m=analyze_skin(image,ctx)
     creative = analyze_creative(ctx,col_m,cin_m,comp_m)
-    vision   = await analyze_vision(image)
-    creative = merge_vision_into_creative(creative, vision)
-    cre_s    = creative["creative_score"]
+    opencv_data = {**{k:v for k,v in ctx.items() if k!="_img"}, "tonal": ctx["tonal"]}
+    vision   = await analyze_vision(image, opencv_data)
+    creative = merge_vision_into_creative(creative, vision, scene_type)
+    cre_s = creative["creative_score"]
     suggestions = build_suggestions(exp_m,col_m,cin_m,comp_m,sha_m,ctx,creative)
     if scene_type=="subject":
-        tech = exp_s*0.22+con_s*0.10+col_s*0.14+(skin_s or 50)*0.08+noi_s*0.05+sha_s*0.08+cin_s*0.13+comp_s*0.10
+        tech_score = exp_s*0.20+con_s*0.08+col_s*0.10+(skin_s or 50)*0.06+noi_s*0.04+sha_s*0.07+cin_s*0.10+comp_s*0.08
+        cinematic_score = int(tech_score*0.50 + cre_s*0.50)
     else:
-        tech = exp_s*0.22+con_s*0.14+col_s*0.18+noi_s*0.06+sha_s*0.08+cin_s*0.16+comp_s*0.11
-    cinematic_score = int(tech*0.85+cre_s*0.15)
+        tech_score = exp_s*0.22+con_s*0.14+col_s*0.18+noi_s*0.06+sha_s*0.08+cin_s*0.16+comp_s*0.11
+        cinematic_score = int(tech_score*0.70 + cre_s*0.30)
     breakdown={"exposure":round(exp_s,1),"contrast":round(con_s,1),"color":round(col_s,1)}
     if scene_type=="subject" and skin_s is not None: breakdown["skin"]=round(skin_s,1)
     breakdown.update({"noise":round(noi_s,1),"sharpness":round(sha_s,1),
