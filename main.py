@@ -353,8 +353,17 @@ def analyze_exposure(image_bgr, ctx):
         if hl_hard>0.005 or hl_soft>0.02 or t[75]>210 or t[95]>225: state="overexposed"
         elif sh_hard>0.01 or sh_soft>0.03 or t[25]<30 or t[50]<60:  state="underexposed"
     score = 100.
-    score -= clamp(hl_hard*5000,0,50); score -= clamp(hl_soft*400,0,25)
-    score -= clamp(sh_hard*4000,0,40); score -= clamp(sh_soft*300,0,15)
+    # Penalty multipliers vary by lum_type:
+    # CONTRASTY scenes naturally have more extreme highlights/shadows — penalize less aggressively
+    if lum == "CONTRASTY":
+        score -= clamp(hl_hard*2000,0,30); score -= clamp(hl_soft*200,0,15)
+        score -= clamp(sh_hard*1500,0,25); score -= clamp(sh_soft*150,0,10)
+    elif lum == "LOW-KEY":
+        score -= clamp(hl_hard*4000,0,45); score -= clamp(hl_soft*350,0,20)
+        score -= clamp(sh_hard*2000,0,25); score -= clamp(sh_soft*150,0,10)
+    else:
+        score -= clamp(hl_hard*5000,0,50); score -= clamp(hl_soft*400,0,25)
+        score -= clamp(sh_hard*4000,0,40); score -= clamp(sh_soft*300,0,15)
     if lum in ("BALANCED","HIGH-KEY"): score -= clamp(abs(t[50]-118)*0.10,0,12)
     return clamp(score), {"state":state,"luminosity_type":lum,
         "p25":round(t[25],1),"p50":round(t[50],1),"p75":round(t[75],1),"p95":round(t[95],1),
