@@ -694,7 +694,7 @@ async def analyze(file: UploadFile = File(...)):
     # LOW-KEY: underexposed is ok/intentional, overexposed is still a problem
     # HIGH-KEY: overexposed is ok/intentional ONLY if highlights aren't clipped
     _hl_soft = float(exp_m.get("highlight_soft", 0))
-    _high_key_truly_ok = lum_type == "HIGH-KEY" and _hl_soft < 0.08
+    _high_key_truly_ok = lum_type == "HIGH-KEY" and _hl_soft < 0.03
     if exp_m.get("state") == "overexposed" and not _high_key_truly_ok:
         _known_issues.append("exposure overexposed")
     elif exp_m.get("state") == "underexposed" and lum_type != "LOW-KEY":
