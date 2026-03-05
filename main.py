@@ -22,7 +22,9 @@ def build_vision_prompt(opencv_data: dict) -> str:
     p50     = t.get(50, 0)
     dr      = t.get("dynamic_range", 0)
     tech_problems = opencv_data.get("_known_issues", [])
-    issues_str = ", ".join(tech_problems) if tech_problems else "none"
+    intentional   = opencv_data.get("_intentional", [])
+    issues_str    = ", ".join(tech_problems) if tech_problems else "none"
+    intent_str    = (" | ".join(intentional)) if intentional else "none"
     return (
         "You are a professional video and photography consultant with deep knowledge of "
         "cinematography, color, composition, and visual storytelling across commercial "
@@ -48,7 +50,8 @@ def build_vision_prompt(opencv_data: dict) -> str:
         f"- Light direction: {light}\n"
         f"- Color saturation={sat:.2f} | harmony={harmony}\n"
         f"- Saliency spread={spread:.2f} (lower=more focused)\n"
-        f"- Technical problems already confirmed: {issues_str}\n\n"
+        f"- Technical problems already confirmed: {issues_str}\n"
+        f"- Confirmed intentional creative choices (do NOT flag as problems): {intent_str}\n\n"
         "STRICT RULES:\n"
         "- If a technical problem is confirmed above, do NOT list that area as a strength\n"
         "- Do NOT invent strengths — only list what is genuinely and clearly working\n"
@@ -104,42 +107,41 @@ async def analyze_vision(image_bgr, opencv_data: dict) -> dict:
 
 def merge_vision_into_creative(creative: dict, vision: dict, scene_type: str) -> dict:
     """
-    Vision API is now the primary source for creative score and elements.
-    OpenCV signals are kept only if Vision doesn't cover them.
-    Score weighting: subject 50/50, ambient 70/30.
+    Vision API is primary source for creative score and elements.
+    Context boosts applied for intentional cinematic choices Vision may undervalue.
+    Weighting: subject 50/50, ambient 70/30.
     """
     if not vision:
         return creative
 
-    # Vision creative score
     vision_score = float(vision.get("creative_score", 50))
-
-    # OpenCV creative score
     opencv_score = float(creative.get("creative_score", 50))
 
-    # Weighted final creative score
-    if scene_type == "subject":
-        final_creative = vision_score * 0.70 + opencv_score * 0.30
-    else:
-        final_creative = vision_score * 0.50 + opencv_score * 0.50
+    # Context-aware boost for intentional choices Vision may still penalise
+    opencv_elements = creative.get("elements_detected", [])
+    opencv_signals  = {e.get("signal","") for e in opencv_elements}
+    boost = 0.0
+    if "low_key_portrait" in opencv_signals:   boost += 6.0
+    if any("bokeh" in s for s in opencv_signals): boost += 5.0
+    if any("leading" in s for s in opencv_signals): boost += 3.0
+    boost = min(boost, 12.0)
+    vision_score_adj = min(100.0, vision_score + boost)
 
-    # Build elements: Vision strengths take priority, then unique OpenCV signals
+    if scene_type == "subject":
+        final_creative = vision_score_adj * 0.70 + opencv_score * 0.30
+    else:
+        final_creative = vision_score_adj * 0.50 + opencv_score * 0.50
+
     vision_strengths = vision.get("strengths", [])
     vision_concerns  = vision.get("concerns", [])
 
-    # Convert vision format to our format
     elements = [{"signal": f"vision_{i}", "label": s["label"], "note": s["note"]}
                 for i, s in enumerate(vision_strengths[:3])]
     concerns  = [{"signal": f"vision_c_{i}", "label": c["label"], "note": c["note"]}
                 for i, c in enumerate(vision_concerns[:2])]
 
-    # Add OpenCV signals that Vision likely didn't cover (unique technical observations)
-    opencv_elements = creative.get("elements_detected", [])
-    opencv_concerns  = creative.get("concerns", [])
     vision_labels_low = {e["label"].lower() for e in elements}
-
     for e in opencv_elements:
-        # Only add if it's genuinely different from what Vision said
         if not any(kw in e["label"].lower() for kw in ["bokeh","leading lines","rule","low-key","directional"]):
             continue
         if not any(kw in vision_labels_low for kw in e["label"].lower().split()):
@@ -153,12 +155,14 @@ def merge_vision_into_creative(creative: dict, vision: dict, scene_type: str) ->
     result["creative_score"]    = float(max(0, min(100, final_creative)))
     result["vision"] = {
         "creative_score":    vision_score,
+        "creative_score_adj": round(vision_score_adj, 1),
         "overall_read":      vision.get("overall_read", ""),
         "grade_intent":      vision.get("grade_intent", ""),
         "lighting_read":     vision.get("lighting_read", ""),
         "color_cast_detail": vision.get("color_cast_detail", ""),
     }
     return result
+
 
 @app.get("/")
 def root(): return {"service": "cinemind-api-v6"}
@@ -663,12 +667,26 @@ async def analyze(file: UploadFile = File(...)):
     skin_s=skin_m=None
     if scene_type=="subject": skin_s,skin_m=analyze_skin(image,ctx)
     creative = analyze_creative(ctx,col_m,cin_m,comp_m)
-    # Build known_issues list for Vision prompt (no contradictions)
+    # Build known_issues and intentional_choices for Vision prompt
     _known_issues = []
-    if exp_m.get("state") in ("overexposed","underexposed"): _known_issues.append(f"exposure {exp_m['state']}")
+    _intentional  = []
+    lum_type = ctx.get("luminosity_type","")
+    # Exposure: only flag as problem if NOT intentional LOW-KEY or HIGH-KEY
+    if exp_m.get("state") == "overexposed" and lum_type != "HIGH-KEY":
+        _known_issues.append("exposure overexposed")
+    elif exp_m.get("state") == "underexposed" and lum_type != "LOW-KEY":
+        _known_issues.append("exposure underexposed")
+    elif lum_type == "LOW-KEY" and exp_m.get("state") in ("ok","underexposed"):
+        _intentional.append("low-key exposure is intentional — dark tones are a creative choice, not an error")
+    elif lum_type == "HIGH-KEY" and exp_m.get("state") in ("ok","overexposed"):
+        _intentional.append("high-key exposure is intentional — bright tones are a creative choice")
     if col_m.get("effective_cast",0) >= 8: _known_issues.append(f"color cast ({col_m.get('temperature','unknown')})")
     if sha_m.get("state") in ("very_soft","soft"): _known_issues.append("sharpness soft")
-    opencv_data = {**{k:v for k,v in ctx.items() if k!="_img"}, "tonal": ctx["tonal"], "_known_issues": _known_issues}
+    # Pass bokeh as intentional if strong
+    if ctx.get("bokeh_ratio",0) > 1.8:
+        _intentional.append(f"background blur/bokeh is intentional subject isolation (ratio={ctx['bokeh_ratio']:.1f})")
+    opencv_data = {**{k:v for k,v in ctx.items() if k!="_img"}, "tonal": ctx["tonal"],
+                   "_known_issues": _known_issues, "_intentional": _intentional}
     vision   = await analyze_vision(image, opencv_data)
     creative = merge_vision_into_creative(creative, vision, scene_type)
     cre_s = creative["creative_score"]
