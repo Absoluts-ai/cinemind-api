@@ -667,6 +667,115 @@ def build_suggestions(exp_m, color_m, cine_m, comp_m, sharp_m, ctx, creative):
         s.append({"category":"Composition","priority":"medium","message":f"Lines tilted ~{abs(tilt):.1f}. Level the shot or correct rotation in post."})
     return s
 
+# ── LUT suggestion ─────────────────────────────────────────────────────────
+
+LUT_CATALOG = [
+    {
+        "id": "ired_neogold",
+        "name": "iRED NeoGold",
+        "pack": "iRED Mode Pack",
+        "tagline": "Bold amber tones, warm contrast, rich skin tones",
+        "url": "https://absoluts-store.com/products/ired-mode-lut-pack-for-iphone",
+        "mood": "warm_rich",
+        "grade_intents": ["warm", "stylized"],
+        "scene_types": ["subject"],
+        "lum_types": ["BALANCED", "LOW-KEY", "CONTRASTY"],
+        "skin_bonus": True,
+    },
+    {
+        "id": "ired_primetone",
+        "name": "iRED PrimeTone",
+        "pack": "iRED Mode Pack",
+        "tagline": "Neutral cinematic base — versatile, skin-safe",
+        "url": "https://absoluts-store.com/products/ired-mode-lut-pack-for-iphone",
+        "mood": "neutral_cinematic",
+        "grade_intents": ["neutral", "desaturated"],
+        "scene_types": ["subject", "ambient"],
+        "lum_types": ["BALANCED", "LOW-KEY", "HIGH-KEY", "CONTRASTY"],
+        "skin_bonus": False,
+    },
+    {
+        "id": "ired_glacier",
+        "name": "iRED Glacier",
+        "pack": "iRED Mode Pack",
+        "tagline": "Cool cyan-blue mood — editorial and modern",
+        "url": "https://absoluts-store.com/products/ired-mode-lut-pack-for-iphone",
+        "mood": "cool_editorial",
+        "grade_intents": ["cool", "stylized"],
+        "scene_types": ["ambient", "subject"],
+        "lum_types": ["BALANCED", "HIGH-KEY", "CONTRASTY"],
+        "skin_bonus": False,
+    },
+    {
+        "id": "kodak_vision3",
+        "name": "Kodak Vision 3",
+        "pack": None,
+        "tagline": "Organic film warmth, natural grain, classic look",
+        "url": "https://absoluts-store.com/products/kodak-vision-3-lut-for-iphone",
+        "mood": "film_warm",
+        "grade_intents": ["warm", "neutral"],
+        "scene_types": ["subject", "ambient"],
+        "lum_types": ["BALANCED", "LOW-KEY"],
+        "skin_bonus": True,
+    },
+    {
+        "id": "fujifilm_3513",
+        "name": "Fujifilm 3513",
+        "pack": None,
+        "tagline": "Soft neutral-cool film, gentle contrast, outdoor tones",
+        "url": "https://absoluts-store.com/products/fujifilm-3513-lut-for-iphone",
+        "mood": "film_neutral",
+        "grade_intents": ["neutral", "cool", "desaturated"],
+        "scene_types": ["subject", "ambient"],
+        "lum_types": ["BALANCED", "HIGH-KEY", "CONTRASTY"],
+        "skin_bonus": False,
+    },
+    {
+        "id": "cinecold",
+        "name": "CineCold Vision",
+        "pack": None,
+        "tagline": "Cold cinematic mood — urban, moody, dramatic",
+        "url": "https://absoluts-store.com/products/cold-film-lut",
+        "mood": "cool_moody",
+        "grade_intents": ["cool", "stylized", "desaturated"],
+        "scene_types": ["ambient", "subject"],
+        "lum_types": ["LOW-KEY", "CONTRASTY", "BALANCED"],
+        "skin_bonus": False,
+    },
+]
+
+def suggest_lut(scene_type: str, lum_type: str, grade_intent: str, has_skin: bool) -> list:
+    """
+    Returns up to 2 ranked LUT suggestions based on scene analysis.
+    Primary match: grade_intent + scene_type.
+    Secondary match: lum_type affinity + skin bonus.
+    """
+    scored = []
+    gi = (grade_intent or "neutral").lower()
+    for lut in LUT_CATALOG:
+        score = 0
+        # grade_intent match (primary signal)
+        if gi in lut["grade_intents"]:
+            score += 10
+        elif gi == "stylized" and "warm" in lut["grade_intents"]:
+            score += 4
+        # scene_type match
+        if scene_type in lut["scene_types"]:
+            score += 5
+        elif lut["scene_types"][0] == scene_type:
+            score += 5
+        # lum_type affinity
+        if lum_type in lut["lum_types"]:
+            score += 3
+        # skin bonus for subject scenes
+        if has_skin and lut["skin_bonus"]:
+            score += 2
+        if score >= 8:
+            scored.append((score, lut))
+    # Sort by score desc, take top 2
+    scored.sort(key=lambda x: -x[0])
+    return [l for _, l in scored[:2]]
+
 # ── endpoint ───────────────────────────────────────────────────────────────
 
 @app.post("/analyze")
@@ -751,11 +860,15 @@ async def analyze(file: UploadFile = File(...)):
     breakdown.update({"noise":round(noi_s,1),"sharpness":round(sha_s,1),
                       "cinematography":round(cin_s,1),"composition":round(comp_s,1),"creative":round(cre_s,1)})
     ctx_out = {k:v for k,v in ctx.items() if k!="_img"}
+    # LUT suggestions
+    grade_intent = (creative.get("vision") or {}).get("grade_intent", "neutral")
+    has_skin = bool(skin_s and skin_s > 40)
+    lut_suggestions = suggest_lut(scene_type, lum_type, grade_intent, has_skin)
     return {"ok":True,"score":cinematic_score,"scene_type":scene_type,"breakdown":breakdown,
         "metrics":{"scene":ctx_out,"exposure":exp_m,"contrast":con_m,"color":col_m,
                    "noise":noi_m,"sharpness":sha_m,"cinematography":cin_m,"composition":comp_m,
                    **( {"skin":skin_m} if skin_m else {})},
-        "creative":creative,"suggestions":suggestions,
+        "creative":creative,"suggestions":suggestions,"lut_suggestions":lut_suggestions,
         "_debug":{"known_issues":_known_issues,"n_issues":len(_known_issues),
                   "effective_cast":round(col_m.get("effective_cast",0),2),
                   "sha_state":sha_m.get("state"),"exp_state":exp_m.get("state"),
