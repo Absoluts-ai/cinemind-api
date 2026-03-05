@@ -690,14 +690,18 @@ async def analyze(file: UploadFile = File(...)):
     _known_issues = []
     _intentional  = []
     lum_type = ctx.get("luminosity_type","")
-    # Exposure: only flag as problem if NOT intentional LOW-KEY or HIGH-KEY
-    if exp_m.get("state") == "overexposed" and lum_type != "HIGH-KEY":
+    # Exposure flagging:
+    # LOW-KEY: underexposed is ok/intentional, overexposed is still a problem
+    # HIGH-KEY: overexposed is ok/intentional ONLY if highlights aren't clipped
+    _hl_soft = float(exp_m.get("highlight_soft", 0))
+    _high_key_truly_ok = lum_type == "HIGH-KEY" and _hl_soft < 0.08
+    if exp_m.get("state") == "overexposed" and not _high_key_truly_ok:
         _known_issues.append("exposure overexposed")
     elif exp_m.get("state") == "underexposed" and lum_type != "LOW-KEY":
         _known_issues.append("exposure underexposed")
-    elif lum_type == "LOW-KEY" and exp_m.get("state") in ("ok","underexposed"):
+    if lum_type == "LOW-KEY" and exp_m.get("state") in ("ok","underexposed"):
         _intentional.append("low-key exposure is intentional — dark tones are a creative choice, not an error")
-    elif lum_type == "HIGH-KEY" and exp_m.get("state") in ("ok","overexposed"):
+    elif _high_key_truly_ok and exp_m.get("state") == "overexposed":
         _intentional.append("high-key exposure is intentional — bright tones are a creative choice")
     if col_m.get("effective_cast",0) >= 6: _known_issues.append(f"color cast ({col_m.get('temperature','unknown')})")
     if sha_m.get("state") in ("very_soft","soft"): _known_issues.append("sharpness soft")
