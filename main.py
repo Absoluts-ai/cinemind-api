@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np, cv2, math, os, base64, json as _json_mod
 import httpx
@@ -616,64 +616,138 @@ def _color_fix_hint(cast_desc: str) -> str:
     else:
         return "Use the white balance or color mixer tool in your editor to neutralize the cast."
 
-def build_suggestions(exp_m, color_m, cine_m, comp_m, sharp_m, ctx, creative):
+def build_suggestions(exp_m, color_m, cine_m, comp_m, sharp_m, ctx, creative, scenario="post"):
+    """
+    scenario: "location" → BlackMagic Cam actionable params
+              "post"     → universal post-production adjustments
+    """
     s=[]; scene=ctx["scene_type"]; lum=ctx["luminosity_type"]
     state=exp_m.get("state","ok")
     hl_hard=float(exp_m.get("highlight_clip",0)); hl_soft=float(exp_m.get("highlight_soft",0))
     sh_hard=float(exp_m.get("shadow_clip",0));   sh_soft=float(exp_m.get("shadow_soft",0))
+
+    # ── Exposure ──────────────────────────────────────────────────────────
     if state=="overexposed":
-        if hl_hard>0.02: msg="Highlights are heavily clipped. Lower exposure ~1-1.5 stops to recover texture."
-        elif hl_soft>0.05: msg="Image looks washed out. Lower exposure ~0.5-1 stop to restore depth in highlights."
-        else: msg="Slightly overexposed. Reduce exposure ~0.5 stop or pull highlights in grading."
+        if scenario=="location":
+            if hl_hard>0.02:
+                msg="Highlights heavily clipped. In BlackMagic Cam: lower ISO by 1-2 stops (e.g. ISO 800→ISO 200), or increase Shutter Angle to 1/250 or higher to cut exposure."
+            elif hl_soft>0.05:
+                msg="Image too bright. In BlackMagic Cam: reduce Exposure by -1 to -1.5 stops using the Exposure dial, or lower ISO (e.g. ISO 400→ISO 100)."
+            else:
+                msg="Slightly overexposed. In BlackMagic Cam: nudge Exposure dial to -0.5 stop. Enable Zebra Guides (75-85%) to monitor highlights while adjusting."
+        else:
+            if hl_hard>0.02: msg="Highlights heavily clipped. In post: pull Highlights wheel down ~20-30 pts, reduce Lift/Offset slightly to recover tonal range."
+            elif hl_soft>0.05: msg="Image looks washed out. In post: lower Gain/Highlights ~15-20 pts and bring Exposure down ~0.5-1 stop via Offset wheel."
+            else: msg="Slightly overexposed. In post: reduce Highlights ~10 pts or pull Exposure down ~0.3 stop with the Offset wheel."
         s.append({"category":"Exposure","priority":"high","message":msg})
     elif state=="underexposed":
         is_lk=any(e["signal"]=="low_key_portrait" for e in creative["elements_detected"])
         if not is_lk:
-            if sh_hard>0.02: msg="Blacks are severely crushed. Lift exposure ~1-1.5 stops or add fill light."
-            elif sh_soft>0.05: msg="Image is underexposed. Lift ~0.5-1 stop or raise shadows in grading."
-            else: msg="Slightly underexposed. Lift exposure ~0.5 stop or raise midtones in post."
+            if scenario=="location":
+                if sh_hard>0.02:
+                    msg="Blacks severely crushed. In BlackMagic Cam: raise ISO (e.g. ISO 400→ISO 1600) or open Shutter Angle to 180° to let in more light."
+                elif sh_soft>0.05:
+                    msg="Image too dark. In BlackMagic Cam: increase Exposure dial +1 to +1.5 stops, or raise ISO one step. Check if you need additional light source."
+                else:
+                    msg="Slightly underexposed. In BlackMagic Cam: nudge Exposure dial to +0.5 stop. Use the Histogram overlay to verify shadow detail is preserved."
+            else:
+                if sh_hard>0.02: msg="Blacks severely crushed. In post: lift Shadows/Lift wheel ~15-20 pts and raise Exposure +0.8-1 stop via Offset."
+                elif sh_soft>0.05: msg="Image underexposed. In post: raise Gain/Exposure +0.5-1 stop with Offset wheel, then lift Shadows ~10 pts to open up the image."
+                else: msg="Slightly underexposed. In post: nudge Offset wheel up ~+0.3 stop or raise Midtones ~8-10 pts."
             s.append({"category":"Exposure","priority":"high","message":msg})
+
+    # ── Color cast ────────────────────────────────────────────────────────
     eff=float(color_m.get("effective_cast",0)); temp=color_m.get("temperature","neutral")
-    tint=color_m.get("tint","neutral"); cg=color_m.get("creative_grade","unlikely")
+    tint_val=color_m.get("tint","neutral"); cg=color_m.get("creative_grade","unlikely")
     vision_cast=(creative.get("vision") or {}).get("color_cast_detail","")
-    if eff>=8.0:
+    if eff>=6.0:
         if cg=="possible":
             cast_desc=vision_cast if vision_cast else temp
             s.append({"category":"Color","priority":"low","message":f"A {cast_desc} cast is present — if this is your intended grade, ignore this. Otherwise correct white balance before applying any look."})
         else:
-            if vision_cast:
-                fix=_color_fix_hint(vision_cast)
-                s.append({"category":"Color","priority":"high" if eff>=12 else "medium","message":f"{vision_cast.capitalize()} detected. {fix}"})
+            # Determine cast direction for specific fix
+            is_cool = temp in ("cool","cool/cyan")
+            is_warm = temp == "warm"
+            is_green = tint_val == "green"
+            is_magenta = tint_val == "magenta"
+            cast_label = vision_cast if vision_cast else (
+                "cool/cyan" if is_cool else ("warm/orange" if is_warm else "color")
+            )
+            if scenario=="location":
+                if is_cool:
+                    msg=f"Cool/cyan cast detected. In BlackMagic Cam: increase White Balance toward 5600K-6500K (Daylight preset or manual), and nudge Tint toward +5 to +10 (positive = magenta)."
+                elif is_warm:
+                    msg=f"Warm/orange cast detected. In BlackMagic Cam: lower White Balance to 4000K-4500K (Shade→Daylight), or nudge Tint to -5 to -10 (negative = green)."
+                elif is_green:
+                    msg=f"Green tint detected. In BlackMagic Cam: adjust Tint toward +8 to +15 (positive = magenta) to neutralize."
+                elif is_magenta:
+                    msg=f"Magenta tint detected. In BlackMagic Cam: adjust Tint toward -8 to -12 (negative = green) to neutralize."
+                else:
+                    msg=f"{cast_label.capitalize()} cast detected. In BlackMagic Cam: use Manual White Balance and adjust K value until the scene appears neutral."
             else:
-                parts=[]
-                if temp=="cool/cyan": parts.append("cyan/teal")
-                elif temp=="cool":    parts.append("cool/blue")
-                elif temp=="warm":    parts.append("warm/yellow-orange")
-                if tint=="green":     parts.append("green tint")
-                elif tint=="magenta": parts.append("magenta tint")
-                label=" + ".join(parts) if parts else "color"
-                fix=_color_fix_hint(label)
-                s.append({"category":"Color","priority":"high" if eff>=12 else "medium","message":f"Noticeable {label} cast detected. {fix}"})
-    sh_state=sharp_m.get("state","sharp"); ls=float(sharp_m.get("laplacian_std",50))
+                if is_cool:
+                    msg=f"Cool/cyan cast detected. In post: shift White Balance warmer (+200-400K) and add slight Saturation reduction on blues/cyans in the Color Wheels."
+                elif is_warm:
+                    msg=f"Warm/orange cast detected. In post: shift White Balance cooler (-200-400K) and reduce orange saturation in the Hue vs Saturation curve."
+                elif is_green:
+                    msg=f"Green tint detected. In post: shift Tint slightly toward magenta (+5 to +10) in the White Balance controls."
+                elif is_magenta:
+                    msg=f"Magenta tint detected. In post: shift Tint slightly toward green (-5 to -10) in the White Balance controls."
+                else:
+                    msg=f"{cast_label.capitalize()} cast. In post: use White Balance controls to neutralize — adjust Temp and Tint until skin tones and whites appear neutral."
+            s.append({"category":"Color","priority":"high" if eff>=12 else "medium","message":msg})
+
+    # ── Sharpness ─────────────────────────────────────────────────────────
+    sh_state=sharp_m.get("state","sharp"); ls=float(sharp_m.get("laplacian_norm",50))
     bokeh=sharp_m.get("bokeh_detected",False); src=sharp_m.get("source","global")
     if sh_state in ("very_soft","soft") and not bokeh:
-        msg=("Image appears very soft or hazy. Check focus, lens cleanliness, or motion blur." if ls<8 else
-             "Image looks slightly soft. Ensure subject is in focus and try a faster shutter speed.")
+        if scenario=="location":
+            msg=("Very soft or hazy image. In BlackMagic Cam: enable Focus Assist (Peaking) to confirm focus, use tap-to-focus on subject, and increase Shutter Speed to 1/250 or faster to reduce motion blur." if ls<8
+                 else "Image slightly soft. In BlackMagic Cam: tap subject to refocus, or use manual focus slider. Try Shutter Angle 1/120 or higher. Enable Focus Assist Guides for precision.")
+        else:
+            msg=("Very soft image. In post: apply Sharpening +15-25, use Unsharp Mask (Radius 0.5, Amount 40-60). Check if source footage has motion blur that can't be fixed in post." if ls<8
+                 else "Image slightly soft. In post: apply Sharpening +10-15 or use Detail Recovery. A slight Clarity/Texture boost (+10-15) can help edge definition.")
         s.append({"category":"Sharpness","priority":"medium","message":msg})
     elif sh_state in ("very_soft","soft") and bokeh and src=="face_roi":
-        s.append({"category":"Sharpness","priority":"medium","message":"Subject face appears soft even with bokeh. Check focus accuracy on the eyes."})
+        if scenario=="location":
+            msg="Subject face appears soft despite bokeh. In BlackMagic Cam: use tap-to-focus directly on the subject's eyes, or enable manual focus and use Focus Assist Peaking."
+        else:
+            msg="Subject face appears soft even with bokeh. In post: apply targeted sharpening on the face area only using a mask/qualifier. Global sharpening won't fix focus errors."
+        s.append({"category":"Sharpness","priority":"medium","message":msg})
+
+    # ── Lighting ──────────────────────────────────────────────────────────
     if ctx["light_direction"]=="frontal" and scene=="subject":
-        s.append({"category":"Lighting","priority":"low","message":"Lighting appears flat/frontal. Moving the key light 30-45 off-axis adds depth and dimension."})
+        if scenario=="location":
+            msg="Lighting is flat/frontal. Reposition your key light or move subject 30-45° off-axis from the light source. Even moving the subject slightly toward a window at an angle improves depth significantly."
+        else:
+            msg="Lighting appears flat/frontal. In post: use Color Wheels to deepen shadows slightly (pull Lift down ~5-8 pts) and boost Highlights to simulate directionality. Adding a subtle vignette helps focus attention."
+        s.append({"category":"Lighting","priority":"low","message":msg})
+
+    # ── Cinematography ─────────────────────────────────────────────────────
     if scene=="subject":
         sep=float(cine_m.get("subject_separation",50))
         if sep<35 and ctx["bokeh_ratio"]<1.8:
-            s.append({"category":"Cinematography","priority":"medium","message":"Subject separation is low. Increase subject-background distance or use a longer focal length."})
+            if scenario=="location":
+                msg="Subject not separated from background. In BlackMagic Cam: switch to the longest lens available (e.g. 3x or 5x), move subject further from background, and/or open aperture if using an external lens."
+            else:
+                msg="Subject separation is low. In post: use a Qualifier or mask to isolate the subject, then add subtle background blur (+5-8 Blur Radius) or reduce background exposure slightly."
+            s.append({"category":"Cinematography","priority":"medium","message":msg})
     else:
         if float(cine_m.get("layer_complexity",50))<35:
-            s.append({"category":"Cinematography","priority":"low","message":"Scene looks flat. Add foreground elements or find leading lines to create depth."})
+            if scenario=="location":
+                msg="Scene looks flat and lacks depth. Reframe to include foreground elements (e.g. plants, railings, objects) that create visual layers. Use leading lines to guide the eye through the frame."
+            else:
+                msg="Scene looks flat. In post: add a slight vignette, deepen shadows in the background using masks, or use Zoom/Position to reframe toward more compositional depth."
+            s.append({"category":"Cinematography","priority":"low","message":msg})
+
+    # ── Composition ────────────────────────────────────────────────────────
     tilt=float(comp_m.get("tilt_deg",0))
     if abs(tilt)>=2.5:
-        s.append({"category":"Composition","priority":"medium","message":f"Lines tilted ~{abs(tilt):.1f}. Level the shot or correct rotation in post."})
+        if scenario=="location":
+            msg=f"Horizon tilted ~{abs(tilt):.1f}°. Enable the Thirds or Centre Crosshair guide in BlackMagic Cam (Screen Guides) to level the shot while recording."
+        else:
+            msg=f"Horizon tilted ~{abs(tilt):.1f}°. In post: use Rotation control to correct — rotate {'+' if tilt<0 else '-'}{abs(tilt):.1f}° to level the frame. Expect slight crop on the edges."
+        s.append({"category":"Composition","priority":"medium","message":msg})
     return s
 
 # ── LUT suggestion ─────────────────────────────────────────────────────────
@@ -790,7 +864,7 @@ def suggest_lut(scene_type: str, lum_type: str, grade_intent: str, has_skin: boo
 
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
+async def analyze(file: UploadFile = File(...), scenario: str = Form("post")):
     contents = await file.read()
     image    = cv2.imdecode(np.frombuffer(contents,np.uint8), cv2.IMREAD_COLOR)
     if image is None: return {"ok":False,"error":"Invalid image"}
@@ -836,7 +910,7 @@ async def analyze(file: UploadFile = File(...)):
     creative["_known_issues_count"] = len(_known_issues)
     creative = merge_vision_into_creative(creative, vision, scene_type)
     cre_s = creative["creative_score"]
-    suggestions = build_suggestions(exp_m,col_m,cin_m,comp_m,sha_m,ctx,creative)
+    suggestions = build_suggestions(exp_m,col_m,cin_m,comp_m,sha_m,ctx,creative,scenario)
     if scene_type=="subject":
         tech_score = exp_s*0.20+con_s*0.08+col_s*0.10+(skin_s or 50)*0.06+noi_s*0.04+sha_s*0.07+cin_s*0.10+comp_s*0.08
         cinematic_score = int(tech_score*0.50 + cre_s*0.50)
@@ -875,7 +949,7 @@ async def analyze(file: UploadFile = File(...)):
     grade_intent = (creative.get("vision") or {}).get("grade_intent", "neutral")
     has_skin = bool(skin_s and skin_s > 40)
     lut_suggestions = suggest_lut(scene_type, lum_type, grade_intent, has_skin)
-    return {"ok":True,"score":cinematic_score,"scene_type":scene_type,"breakdown":breakdown,
+    return {"ok":True,"score":cinematic_score,"scene_type":scene_type,"scenario":scenario,"breakdown":breakdown,
         "metrics":{"scene":ctx_out,"exposure":exp_m,"contrast":con_m,"color":col_m,
                    "noise":noi_m,"sharpness":sha_m,"cinematography":cin_m,"composition":comp_m,
                    **( {"skin":skin_m} if skin_m else {})},
