@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np, cv2, math, os, base64, json as _json_mod
 import httpx
@@ -788,60 +788,6 @@ def suggest_lut(scene_type: str, lum_type: str, grade_intent: str, has_skin: boo
 # ── endpoint ───────────────────────────────────────────────────────────────
 
 
-@app.options("/learn")
-async def learn_options():
-    return {}
-
-@app.post("/learn")
-async def learn(request: Request):
-    """
-    Generate a short educational explanation for a suggestion.
-    Input: { category, message, scene_type, score, context }
-    Output: { explanation }
-    """
-    if not ANTHROPIC_API_KEY:
-        return {"ok": False, "error": "No API key"}
-    try:
-        req = await request.json()
-    except Exception:
-        return {"ok": False, "error": "Invalid JSON body"}
-    category    = req.get("category", "")
-    message     = req.get("message", "")
-    scene_type  = req.get("scene_type", "")
-    score       = req.get("score", 0)
-    context     = req.get("context", "")  # overall_read from Vision
-    prompt = (
-        "You are a cinematography teacher explaining concepts to a beginner iPhone filmmaker.\n\n"
-        f"They just analyzed a {scene_type} scene and received this suggestion:\n"
-        f"Category: {category}\n"
-        f"Suggestion: {message}\n"
-        + (f"Shot context: {context}\n" if context else "") +
-        "\nExplain WHY this matters in 3-4 short sentences. "
-        "Be direct, concrete, and practical. "
-        "Use simple language — no jargon. "
-        "End with one actionable tip they can apply immediately next time they shoot. "
-        "Do not repeat the suggestion itself. Do not use bullet points or headers. "
-        "Respond with plain text only."
-    )
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_API_KEY,
-                         "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 200,
-                    "messages": [{"role": "user", "content": prompt}]
-                }
-            )
-        if resp.status_code != 200:
-            return {"ok": False, "error": "API error"}
-        text = resp.json()["content"][0]["text"].strip()
-        return {"ok": True, "explanation": text}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
