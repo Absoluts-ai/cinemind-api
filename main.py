@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np, cv2, math, os, base64, json as _json_mod
 import httpx
@@ -789,7 +789,7 @@ def suggest_lut(scene_type: str, lum_type: str, grade_intent: str, has_skin: boo
 
 
 @app.post("/learn")
-async def learn(req: dict):
+async def learn(request: Request):
     """
     Generate a short educational explanation for a suggestion.
     Input: { category, message, scene_type, score, context }
@@ -797,6 +797,10 @@ async def learn(req: dict):
     """
     if not ANTHROPIC_API_KEY:
         return {"ok": False, "error": "No API key"}
+    try:
+        req = await request.json()
+    except Exception:
+        return {"ok": False, "error": "Invalid JSON body"}
     category    = req.get("category", "")
     message     = req.get("message", "")
     scene_type  = req.get("scene_type", "")
