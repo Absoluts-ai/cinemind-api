@@ -788,6 +788,10 @@ def suggest_lut(scene_type: str, lum_type: str, grade_intent: str, has_skin: boo
 # ── endpoint ───────────────────────────────────────────────────────────────
 
 
+@app.options("/learn")
+async def learn_options():
+    return {}
+
 @app.post("/learn")
 async def learn(request: Request):
     """
